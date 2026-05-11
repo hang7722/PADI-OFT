@@ -14,10 +14,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
 
+from padi_oft.runtime.physics_runtime import PadiPhysicsAwareRuntime, PadiPhysicsConfig
+
 import draccus
 import numpy as np
 import tqdm
 from libero.libero import benchmark
+from padi_oft.runtime.video_overlay import overlay_padi_scores_on_frame
 
 import wandb
 
@@ -126,6 +129,12 @@ class GenerateConfig:
     wandb_project: str = "your-wandb-project"        # Name of WandB project
 
     seed: int = 7                                    # Random Seed (for reproducibility)
+
+    use_padi_runtime: bool = False                   # Enable PADI phase-1 physics runtime telemetry
+    padi_debug: bool = False                         # Print per-step PADI signals when runtime is enabled
+    padi_profile: str = "legacy"                    # PADI runtime profile: legacy or oft_calibrated
+    padi_video_overlay: bool = False                # Overlay PADI scores on rollout MP4 frames when enabled
+    padi_overlay_position: str = "top_left"         # Overlay position: top_left/top_right/bottom_left/bottom_right
 
     # fmt: on
 
@@ -262,6 +271,9 @@ def prepare_observation(obs, resize_size):
     return observation, img  # Return both processed observation and original image for replay
 
 
+
+
+
 def process_action(action, model_family):
     """Process action before sending to environment."""
     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
@@ -287,6 +299,7 @@ def run_episode(
     noisy_action_projector=None,
     initial_state=None,
     log_file=None,
+    padi_runtime=None,
 ):
     """Run a single episode in the environment."""
     # Reset environment
@@ -310,6 +323,8 @@ def run_episode(
     replay_images = []
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
 
+    padi_episode_telemetry = []
+
     # Run episode
     success = False
     try:
@@ -321,8 +336,7 @@ def run_episode(
                 continue
 
             # Prepare observation
-            observation, img = prepare_observation(obs, resize_size)
-            replay_images.append(img)
+            observation, _ = prepare_observation(obs, resize_size)
 
             # If action queue is empty, requery model
             if len(action_queue) == 0:
@@ -348,6 +362,58 @@ def run_episode(
 
             # Execute action in environment
             obs, reward, done, info = env.step(action.tolist())
+
+            padi_out = None
+            eef_pos = None
+            if padi_runtime is not None:
+                eef_pos = obs.get("robot0_eef_pos") if isinstance(obs, dict) else None
+                if eef_pos is None:
+                    if cfg.padi_debug:
+                        log_message(f"[PADI] warning: missing robot0_eef_pos at step={t}, skipping update", log_file)
+                else:
+                    gripper_raw = obs.get("robot0_gripper_qpos") if isinstance(obs, dict) else None
+                    gripper_value = None if gripper_raw is None else float(np.asarray(gripper_raw).reshape(-1).mean())
+                    padi_out = padi_runtime.update(eef_pos=eef_pos, gripper_value=gripper_value, step_idx=t)
+                    padi_episode_telemetry.append(
+                        {
+                            "step_idx": t,
+                            "geometry_risk": padi_out.geometry_risk,
+                            "precise_active": padi_out.precise_active,
+                            "transit_score": padi_out.transit_score,
+                            "debug": padi_out.debug,
+                        }
+                    )
+                    if cfg.padi_debug:
+                        dbg = padi_out.debug
+                        log_message(
+                            f"[PADI] step={t} geometry_risk={padi_out.geometry_risk:.4f} "
+                            f"precise_active={padi_out.precise_active} transit_score={padi_out.transit_score:.4f} "
+                            f"gripper_value={gripper_value} gripper_engaged={dbg.get('gripper_engaged')} "
+                            f"gripper_stably_closed={dbg.get('gripper_stably_closed')} "
+                            f"holding_confidence={dbg.get('holding_confidence', 0.0):.4f} "
+                            f"gripper_score={dbg.get('gripper_score', 0.0):.4f} "
+                            f"motion_score={dbg.get('motion_score', 0.0):.4f} "
+                            f"not_precise_score={dbg.get('not_precise_score', 1.0):.4f} "
+                            f"recent_mean_speed={dbg.get('recent_mean_speed', 0.0):.4f} "
+                            f"recent_mean_disp={dbg.get('recent_mean_disp', 0.0):.4f} "
+                            f"total_speed={dbg.get('total_speed', 0.0):.4f} "
+                            f"xy_speed={dbg.get('xy_speed', 0.0):.4f} z_speed={dbg.get('z_speed', 0.0):.4f} "
+                            f"curvature={dbg.get('curvature', 0.0):.4f} d_z={dbg.get('d_z', 0.0):.4f} "
+                            f"u_s={dbg.get('u_s', 0.0):.4f} u_xy={dbg.get('u_xy', 0.0):.4f} "
+                            f"dz_term={dbg.get('dz_term', 0.0):.4f} curve_term={dbg.get('curve_term', 0.0):.4f} "
+                            f"slow_term={dbg.get('slow_term', 0.0):.4f} precise_term={dbg.get('precise_term', 0.0):.4f} "
+                            f"local_term={dbg.get('local_term', 0.0):.4f} local_interaction_candidate={dbg.get('local_interaction_candidate')} "
+                            f"precise_candidate={dbg.get('precise_candidate')}",
+                            log_file,
+                        )
+
+            frame_for_video = get_libero_image(obs)
+            if cfg.use_padi_runtime and cfg.padi_video_overlay:
+                frame_for_video = overlay_padi_scores_on_frame(
+                    frame_for_video, padi_out if eef_pos is not None else None, t, position=cfg.padi_overlay_position
+                )
+            replay_images.append(frame_for_video)
+
             if done:
                 success = True
                 break
@@ -356,7 +422,7 @@ def run_episode(
     except Exception as e:
         log_message(f"Episode error: {e}", log_file)
 
-    return success, replay_images
+    return success, replay_images, padi_episode_telemetry
 
 
 def run_task(
@@ -372,6 +438,7 @@ def run_task(
     total_episodes=0,
     total_successes=0,
     log_file=None,
+    padi_runtime=None,
 ):
     """Run evaluation for a single task."""
     # Get task
@@ -408,7 +475,10 @@ def run_task(
         log_message(f"Starting episode {task_episodes + 1}...", log_file)
 
         # Run episode
-        success, replay_images = run_episode(
+        if padi_runtime is not None:
+            padi_runtime.reset()
+
+        success, replay_images, padi_episode_telemetry = run_episode(
             cfg,
             env,
             task_description,
@@ -420,6 +490,7 @@ def run_task(
             noisy_action_projector,
             initial_state,
             log_file,
+            padi_runtime,
         )
 
         # Update counters
@@ -470,6 +541,23 @@ def eval_libero(cfg: GenerateConfig) -> float:
     # Initialize model and components
     model, action_head, proprio_projector, noisy_action_projector, processor = initialize_model(cfg)
 
+    padi_runtime = None
+    if cfg.use_padi_runtime:
+        if cfg.padi_profile == "legacy":
+            padi_config = PadiPhysicsConfig()
+        elif cfg.padi_profile == "oft_calibrated":
+            padi_config = PadiPhysicsConfig.oft_calibrated()
+        elif cfg.padi_profile == "oft_calibrated_v2":
+            padi_config = PadiPhysicsConfig.oft_calibrated_v2()
+        elif cfg.padi_profile == "oft_calibrated_v3":
+            padi_config = PadiPhysicsConfig.oft_calibrated_v3()
+        else:
+            raise ValueError(f"Unknown padi_profile: {cfg.padi_profile}")
+        padi_runtime = PadiPhysicsAwareRuntime(padi_config)
+        logger.info(f"[PADI] using profile: {cfg.padi_profile}")
+    if cfg.padi_debug and not cfg.use_padi_runtime:
+        logger.warning("--padi_debug=True but --use_padi_runtime=False; PADI telemetry disabled.")
+
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
 
@@ -499,6 +587,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
             total_episodes,
             total_successes,
             log_file,
+            padi_runtime,
         )
 
     # Calculate final success rate
