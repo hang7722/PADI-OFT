@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 from padi_oft.runtime.physics_runtime import PadiPhysicsAwareRuntime, PadiPhysicsConfig
+from padi_oft.runtime.gsdr_controller import PadiGSDRConfig, PadiGSDRController
 
 import draccus
 import numpy as np
@@ -136,6 +137,11 @@ class GenerateConfig:
     padi_video_overlay: bool = False                # Overlay PADI scores on rollout MP4 frames when enabled
     padi_overlay_position: str = "top_left"         # Overlay position: top_left/top_right/bottom_left/bottom_right
 
+    gsdr: bool = False                               # Enable GSDR geometry-risk-only budget telemetry
+    gsdr_debug: bool = False                         # Print per-step GSDR budget telemetry
+    gsdr_base_keep_ratio: float = 0.50              # Simulated FastV base keep ratio before FastV integration
+    gsdr_num_patches_per_image: int = 256           # Simulated per-image vision patch token count before FastV integration
+
     # fmt: on
 
 
@@ -150,6 +156,11 @@ def validate_config(cfg: GenerateConfig) -> None:
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
+
+    if cfg.gsdr:
+        assert cfg.use_padi_runtime, "--gsdr=True requires --use_padi_runtime=True"
+        assert 0.0 < cfg.gsdr_base_keep_ratio <= 1.0
+        assert cfg.gsdr_num_patches_per_image > 0
 
 
 def initialize_model(cfg: GenerateConfig):
@@ -300,6 +311,7 @@ def run_episode(
     initial_state=None,
     log_file=None,
     padi_runtime=None,
+    gsdr_controller=None,
 ):
     """Run a single episode in the environment."""
     # Reset environment
@@ -407,6 +419,24 @@ def run_episode(
                             log_file,
                         )
 
+            gsdr_out = None
+            if gsdr_controller is not None and padi_out is not None:
+                num_vision_tokens = cfg.gsdr_num_patches_per_image * cfg.num_images_in_input
+                gsdr_out = gsdr_controller.update(
+                    geometry_risk=padi_out.geometry_risk,
+                    base_keep_ratio=cfg.gsdr_base_keep_ratio,
+                    num_vision_tokens=num_vision_tokens,
+                )
+                if cfg.gsdr_debug:
+                    log_message(
+                        f"[GSDR] step={t} g_raw={gsdr_out.g_raw:.4f} "
+                        f"geometry_risk_smooth={gsdr_out.geometry_risk_smooth:.4f} "
+                        f"keep_ratio_cont={gsdr_out.keep_ratio_cont:.4f} raw_keep_tokens={gsdr_out.raw_keep_tokens:.1f} "
+                        f"base_keep_tokens={gsdr_out.base_keep_tokens} keep_ratio={gsdr_out.keep_ratio:.4f} "
+                        f"keep_tokens={gsdr_out.keep_tokens} no_prune={gsdr_out.no_prune}",
+                        log_file,
+                    )
+
             frame_for_video = get_libero_image(obs)
             if cfg.use_padi_runtime and cfg.padi_video_overlay:
                 frame_for_video = overlay_padi_scores_on_frame(
@@ -439,6 +469,7 @@ def run_task(
     total_successes=0,
     log_file=None,
     padi_runtime=None,
+    gsdr_controller=None,
 ):
     """Run evaluation for a single task."""
     # Get task
@@ -477,6 +508,8 @@ def run_task(
         # Run episode
         if padi_runtime is not None:
             padi_runtime.reset()
+        if gsdr_controller is not None:
+            gsdr_controller.reset()
 
         success, replay_images, padi_episode_telemetry = run_episode(
             cfg,
@@ -491,6 +524,7 @@ def run_task(
             initial_state,
             log_file,
             padi_runtime,
+            gsdr_controller,
         )
 
         # Update counters
@@ -558,6 +592,11 @@ def eval_libero(cfg: GenerateConfig) -> float:
     if cfg.padi_debug and not cfg.use_padi_runtime:
         logger.warning("--padi_debug=True but --use_padi_runtime=False; PADI telemetry disabled.")
 
+    gsdr_controller = None
+    if cfg.gsdr:
+        gsdr_controller = PadiGSDRController(PadiGSDRConfig())
+        logger.info("[GSDR] enabled: geometry-risk-only budget controller telemetry")
+
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
 
@@ -588,6 +627,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
             total_successes,
             log_file,
             padi_runtime,
+            gsdr_controller,
         )
 
     # Calculate final success rate
