@@ -391,14 +391,16 @@ def run_episode(
                     use_film=cfg.use_film,
                 )
                 latest_fastv_pruning_info = getattr(model, "last_pruning_info", None)
-                if cfg.use_fastv:
+                should_run_fastv_sanity = cfg.use_fastv and (cfg.fastv_debug or cfg.fastv_sanity_assert)
+                if should_run_fastv_sanity:
                     pruning_info = getattr(model, "last_pruning_info", None)
                     remap_info = getattr(model, "last_action_remap_info", None)
                     if pruning_info is None:
-                        log_message(
-                            f"[PADI-OFT FastV-Sanity] step={t} ERROR pruning_info=None; FastV may not have been called.",
-                            log_file,
-                        )
+                        if cfg.fastv_debug:
+                            log_message(
+                                f"[PADI-OFT FastV-Sanity] step={t} ERROR pruning_info=None; FastV may not have been called.",
+                                log_file,
+                            )
                         if cfg.fastv_sanity_assert:
                             raise RuntimeError("FastV sanity assert failed: pruning_info is None")
                     else:
@@ -426,30 +428,31 @@ def run_episode(
                         post_tokens_preserved = all(idx < vision_end for idx in pruned_list)
                         proprio_preserved = vision_end in kept_list
                         shape_ok = kept_seq_length == expected_kept_seq_length
-                        log_message(
-                            f"[PADI-OFT FastV-Sanity] step={t} skipped={skipped} skip_reason={skip_reason} "
-                            f"original={original_seq_length} kept={kept_seq_length} pruned={pruned_count} "
-                            f"expected_pruned={expected_pruned_count} expected_kept={expected_kept_seq_length} "
-                            f"shape_ok={shape_ok} pruned_within_vision={pruned_within_vision} "
-                            f"bos_preserved={bos_preserved} proprio_preserved={proprio_preserved} "
-                            f"post_tokens_preserved={post_tokens_preserved} fastv_k={fastv_k} fastv_r={fastv_r} "
-                            f"image_token_start_index={vision_start} image_token_length={vision_len} image_end={vision_end} "
-                            f"num_images_in_input={num_images_in_input} patches_per_image={patches_per_image} "
-                            f"num_keep_per_image={num_keep_per_image}",
-                            log_file,
-                        )
-                        if remap_info is not None:
+                        if cfg.fastv_debug:
                             log_message(
-                                f"[PADI-OFT FastV-ActionRemap] step={t} "
-                                f"original_start={remap_info.get('original_action_start')} "
-                                f"new_start={remap_info.get('new_action_start')} "
-                                f"shift={remap_info.get('action_shift')} "
-                                f"count={remap_info.get('action_token_count')} "
-                                f"preserved={remap_info.get('action_positions_preserved')} "
-                                f"contiguous={remap_info.get('action_new_positions_contiguous')} "
-                                f"fallback={remap_info.get('fallback', False)}",
+                                f"[PADI-OFT FastV-Sanity] step={t} skipped={skipped} skip_reason={skip_reason} "
+                                f"original={original_seq_length} kept={kept_seq_length} pruned={pruned_count} "
+                                f"expected_pruned={expected_pruned_count} expected_kept={expected_kept_seq_length} "
+                                f"shape_ok={shape_ok} pruned_within_vision={pruned_within_vision} "
+                                f"bos_preserved={bos_preserved} proprio_preserved={proprio_preserved} "
+                                f"post_tokens_preserved={post_tokens_preserved} fastv_k={fastv_k} fastv_r={fastv_r} "
+                                f"image_token_start_index={vision_start} image_token_length={vision_len} image_end={vision_end} "
+                                f"num_images_in_input={num_images_in_input} patches_per_image={patches_per_image} "
+                                f"num_keep_per_image={num_keep_per_image}",
                                 log_file,
                             )
+                            if remap_info is not None:
+                                log_message(
+                                    f"[PADI-OFT FastV-ActionRemap] step={t} "
+                                    f"original_start={remap_info.get('original_action_start')} "
+                                    f"new_start={remap_info.get('new_action_start')} "
+                                    f"shift={remap_info.get('action_shift')} "
+                                    f"count={remap_info.get('action_token_count')} "
+                                    f"preserved={remap_info.get('action_positions_preserved')} "
+                                    f"contiguous={remap_info.get('action_new_positions_contiguous')} "
+                                    f"fallback={remap_info.get('fallback', False)}",
+                                    log_file,
+                                )
                         if cfg.fastv_sanity_assert:
                             if skipped:
                                 raise RuntimeError(f"FastV sanity assert failed: skipped=True reason={skip_reason}")
