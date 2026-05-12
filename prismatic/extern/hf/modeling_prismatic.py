@@ -629,7 +629,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             multimodal_labels = self._build_multimodal_labels(labels, projected_patch_embeddings)
 
             # Dispatch to language model
-            language_model_output = self.language_model(
+            language_model_output = self._maybe_fastv_language_model_forward(
                 input_ids=None,
                 attention_mask=multimodal_attention_mask,
                 position_ids=None,
@@ -716,6 +716,53 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
     def _reorder_cache(self, *args, **kwargs) -> Any:
         return self.language_model._reorder_cache(*args, **kwargs)
 
+    # PADI-OFT FastV Stage-2
+    def _build_fastv_config(self):
+        return {
+            "use_fastv": bool(getattr(self, "use_fastv", getattr(self.config, "use_fastv", False))),
+            "fastv_k": int(getattr(self, "fastv_k", getattr(self.config, "fastv_k", 3))),
+            "fastv_r": float(getattr(self, "fastv_r", getattr(self.config, "fastv_r", 0.5))),
+            "image_token_start_index": int(
+                getattr(self, "fastv_image_token_start_index", getattr(self.config, "fastv_image_token_start_index", 1))
+            ),
+            "image_token_length": int(
+                getattr(self, "fastv_image_token_length", getattr(self.config, "fastv_image_token_length", 512))
+            ),
+            "num_images_in_input": int(
+                getattr(self, "fastv_num_images_in_input", self.vision_backbone.get_num_images_in_input())
+            ),
+            "patches_per_image": int(
+                getattr(self, "fastv_patches_per_image", getattr(self.config, "fastv_patches_per_image", 256))
+            ),
+        }
+
+    # PADI-OFT FastV Stage-2
+    def _maybe_fastv_language_model_forward(self, **kwargs):
+        self.pruning_info = None
+        fastv_config = self._build_fastv_config()
+        used_fastv = False
+        if kwargs.get("labels", None) is not None:
+            out = self.language_model(**kwargs)
+        elif fastv_config["use_fastv"] and hasattr(self.language_model, "fastv_forward"):
+            out = self.language_model.fastv_forward(**kwargs, fastv_config=fastv_config)
+            used_fastv = True
+        else:
+            out = self.language_model(**kwargs)
+        if used_fastv and hasattr(self.language_model, "pruning_info"):
+            self.pruning_info = self.language_model.pruning_info
+            if getattr(self, "fastv_debug", getattr(self.config, "fastv_debug", False)) and self.pruning_info is not None:
+                if self.pruning_info.get("skipped", True):
+                    print(f"[PADI-OFT FastV] skipped=True reason={self.pruning_info.get('skip_reason', 'unknown')}")
+                else:
+                    print(
+                        "[PADI-OFT FastV] "
+                        f"skipped=False original={self.pruning_info.get('original_seq_length')} "
+                        f"kept={self.pruning_info.get('kept_seq_length')} "
+                        f"layer={self.pruning_info.get('pruning_layer')} "
+                        f"num_keep_per_image={self.pruning_info.get('num_keep_per_image')}"
+                    )
+        return out
+
 
 class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
     config_class: PretrainedConfig = OpenVLAConfig
@@ -768,6 +815,53 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         labels[:, -1] = STOP_INDEX
 
         return labels
+
+    def _select_action_hidden_states_after_fastv(
+        self, last_hidden_states: torch.Tensor, original_action_start: int, action_token_count: int
+    ) -> torch.Tensor:
+        pruning_info = getattr(self, "pruning_info", None)
+        if (
+            pruning_info is None
+            or pruning_info.get("skipped", True)
+            or pruning_info.get("kept_indices", None) is None
+        ):
+            self.last_action_remap_info = {
+                "original_action_start": int(original_action_start),
+                "new_action_start": int(original_action_start),
+                "action_token_count": int(action_token_count),
+                "action_positions_preserved": True,
+                "action_new_positions_contiguous": True,
+                "action_shift": 0,
+                "fallback": True,
+            }
+            return last_hidden_states[:, original_action_start : original_action_start + action_token_count, :]
+
+        kept_indices = pruning_info["kept_indices"]
+        if not torch.is_tensor(kept_indices):
+            kept_indices = torch.tensor(kept_indices)
+        kept_indices = kept_indices.to(last_hidden_states.device, dtype=torch.long)
+        action_positions = torch.arange(
+            original_action_start, original_action_start + action_token_count, device=last_hidden_states.device
+        )
+        mapped = torch.searchsorted(kept_indices, action_positions)
+        in_bounds = mapped < kept_indices.shape[0]
+        safe_mapped = mapped.clamp(max=kept_indices.shape[0] - 1)
+        matched = kept_indices[safe_mapped] == action_positions
+        valid = in_bounds & matched
+        if not torch.all(valid):
+            raise RuntimeError("FastV should not prune action tokens, but action positions are missing after pruning.")
+        self.last_action_remap_info = {
+            "original_action_start": int(original_action_start),
+            "new_action_start": int(mapped[0].item()) if mapped.numel() > 0 else int(original_action_start),
+            "action_token_count": int(action_token_count),
+            "action_positions_preserved": True,
+            "action_new_positions_contiguous": bool(torch.all(mapped[1:] == mapped[:-1] + 1).item())
+            if mapped.numel() > 1
+            else True,
+            "action_shift": int(original_action_start - mapped[0].item()) if mapped.numel() > 0 else 0,
+            "fallback": False,
+        }
+        return last_hidden_states.index_select(dim=1, index=mapped)
 
     def _unnormalize_actions(self, normalized_actions, unnorm_key=None):
         """Unnormalize actions using dataset statistics"""
@@ -844,14 +938,14 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             )
 
             # Forward pass through language model
-            language_model_output = self.language_model(
+            language_model_output = self._maybe_fastv_language_model_forward(
                 input_ids=None,
                 attention_mask=multimodal_attention_mask,
                 position_ids=None,
                 past_key_values=None,
                 inputs_embeds=multimodal_embeddings,
                 labels=None,
-                use_cache=None,
+                use_cache=False,
                 output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
@@ -859,11 +953,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
             # Extract hidden states for action portion of response
             last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
-            actions_hidden_states = last_hidden_states[
-                :,
-                NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
-                :,
-            ]  # (B, act_chunk_len, D)
+            original_action_start = NUM_PATCHES + NUM_PROMPT_TOKENS
+            action_token_count = ACTION_DIM * NUM_ACTIONS_CHUNK
+            actions_hidden_states = self._select_action_hidden_states_after_fastv(
+                last_hidden_states, original_action_start, action_token_count
+            )
 
             # Predict noise and update noisy actions: x_t -> x_{t-1}
             noise_pred = action_head.predict_noise(actions_hidden_states)
@@ -896,14 +990,14 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
 
         # Forward pass through language model
-        language_model_output = self.language_model(
+        language_model_output = self._maybe_fastv_language_model_forward(
             input_ids=None,
             attention_mask=multimodal_attention_mask,
             position_ids=None,
             past_key_values=None,
             inputs_embeds=multimodal_embeddings,
             labels=None,
-            use_cache=None,
+            use_cache=False,
             output_attentions=False,
             output_hidden_states=True,
             return_dict=True,
@@ -911,11 +1005,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         # Extract hidden states for action tokens
         last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
-        actions_hidden_states = last_hidden_states[
-            :,
-            NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
-            :,
-        ]  # (B, act_chunk_len, D)
+        original_action_start = NUM_PATCHES + NUM_PROMPT_TOKENS
+        action_token_count = ACTION_DIM * NUM_ACTIONS_CHUNK
+        actions_hidden_states = self._select_action_hidden_states_after_fastv(
+            last_hidden_states, original_action_start, action_token_count
+        )
 
         # Handle different prediction methods
         if action_head is not None:
@@ -1054,6 +1148,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         # Unnormalize predicted actions
         actions = self._unnormalize_actions(normalized_actions, unnorm_key)
+        self.last_pruning_info = getattr(self, "pruning_info", None)
 
         return actions, actions_hidden_states
 

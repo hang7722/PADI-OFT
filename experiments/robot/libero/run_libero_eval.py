@@ -21,7 +21,7 @@ import draccus
 import numpy as np
 import tqdm
 from libero.libero import benchmark
-from padi_oft.runtime.video_overlay import overlay_padi_scores_on_frame
+from padi_oft.runtime.video_overlay import overlay_fastv_pruning_on_views, overlay_padi_scores_on_frame
 
 import wandb
 
@@ -142,6 +142,18 @@ class GenerateConfig:
     gsdr_base_keep_ratio: float = 0.50              # Simulated FastV base keep ratio before FastV integration
     gsdr_num_patches_per_image: int = 256           # Simulated per-image vision patch token count before FastV integration
 
+    use_fastv: bool = False                         # Enable FastV Stage-2 call chain
+    fastv_k: int = 3                                # FastV pruning layer index
+    fastv_r: float = 0.5                            # FastV prune ratio inside each image segment
+    fastv_image_token_start_index: int = 1          # FastV vision token block start index
+    fastv_image_token_length: int = 512             # FastV total vision patch tokens (exclude proprio/diffusion)
+    fastv_patches_per_image: int = 256              # FastV per-image patch count
+    fastv_debug: bool = False                       # Print one-line FastV pruning summaries
+    fastv_sanity_assert: bool = False               # Raise RuntimeError on FastV sanity check failures
+    fastv_video_overlay: bool = False               # Overlay FastV pruning mask on dual-view rollout frames
+    fastv_overlay_alpha: int = 170                  # Dark mask strength for pruned FastV patches
+    fastv_overlay_label: bool = True                # Show tiny "Global/Wrist/FastV mask" labels
+
     # fmt: on
 
 
@@ -161,6 +173,19 @@ def validate_config(cfg: GenerateConfig) -> None:
         assert cfg.use_padi_runtime, "--gsdr=True requires --use_padi_runtime=True"
         assert 0.0 < cfg.gsdr_base_keep_ratio <= 1.0
         assert cfg.gsdr_num_patches_per_image > 0
+
+    assert 0.0 <= cfg.fastv_r < 1.0, "fastv_r must satisfy 0.0 <= fastv_r < 1.0"
+    assert cfg.fastv_k >= 0, "fastv_k must be >= 0"
+    assert cfg.fastv_image_token_start_index >= 0, "fastv_image_token_start_index must be >= 0"
+    assert cfg.fastv_image_token_length > 0, "fastv_image_token_length must be > 0"
+    assert cfg.fastv_patches_per_image > 0, "fastv_patches_per_image must be > 0"
+    if cfg.use_fastv:
+        expected_len = cfg.num_images_in_input * cfg.fastv_patches_per_image
+        if cfg.fastv_image_token_length != expected_len:
+            logger.warning(
+                "[PADI-OFT FastV] recommended fastv_image_token_length == num_images_in_input * fastv_patches_per_image "
+                f"(got {cfg.fastv_image_token_length} vs {expected_len})"
+            )
 
 
 def initialize_model(cfg: GenerateConfig):
@@ -336,6 +361,7 @@ def run_episode(
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
 
     padi_episode_telemetry = []
+    latest_fastv_pruning_info = None
 
     # Run episode
     success = False
@@ -364,6 +390,81 @@ def run_episode(
                     noisy_action_projector=noisy_action_projector,
                     use_film=cfg.use_film,
                 )
+                latest_fastv_pruning_info = getattr(model, "last_pruning_info", None)
+                if cfg.use_fastv:
+                    pruning_info = getattr(model, "last_pruning_info", None)
+                    remap_info = getattr(model, "last_action_remap_info", None)
+                    if pruning_info is None:
+                        log_message(
+                            f"[PADI-OFT FastV-Sanity] step={t} ERROR pruning_info=None; FastV may not have been called.",
+                            log_file,
+                        )
+                        if cfg.fastv_sanity_assert:
+                            raise RuntimeError("FastV sanity assert failed: pruning_info is None")
+                    else:
+                        skipped = bool(pruning_info.get("skipped", True))
+                        skip_reason = pruning_info.get("skip_reason", None)
+                        original_seq_length = int(pruning_info.get("original_seq_length", -1))
+                        kept_seq_length = int(pruning_info.get("kept_seq_length", -1))
+                        fastv_k = pruning_info.get("fastv_k", None)
+                        fastv_r = pruning_info.get("fastv_r", None)
+                        vision_start = int(pruning_info.get("image_token_start_index", 0))
+                        vision_len = int(pruning_info.get("image_token_length", 0))
+                        vision_end = vision_start + vision_len
+                        num_images_in_input = pruning_info.get("num_images_in_input", None)
+                        patches_per_image = pruning_info.get("patches_per_image", None)
+                        num_keep_per_image = pruning_info.get("num_keep_per_image", [])
+                        pruned_indices = pruning_info.get("pruned_indices", [])
+                        kept_indices = pruning_info.get("kept_indices", [])
+                        pruned_list = pruned_indices.tolist() if hasattr(pruned_indices, "tolist") else list(pruned_indices)
+                        kept_list = kept_indices.tolist() if hasattr(kept_indices, "tolist") else list(kept_indices)
+                        pruned_count = len(pruned_list)
+                        expected_pruned_count = int(vision_len - sum(num_keep_per_image)) if num_keep_per_image else 0
+                        expected_kept_seq_length = int(original_seq_length - expected_pruned_count)
+                        pruned_within_vision = all(vision_start <= idx < vision_end for idx in pruned_list)
+                        bos_preserved = 0 in kept_list
+                        post_tokens_preserved = all(idx < vision_end for idx in pruned_list)
+                        proprio_preserved = vision_end in kept_list
+                        shape_ok = kept_seq_length == expected_kept_seq_length
+                        log_message(
+                            f"[PADI-OFT FastV-Sanity] step={t} skipped={skipped} skip_reason={skip_reason} "
+                            f"original={original_seq_length} kept={kept_seq_length} pruned={pruned_count} "
+                            f"expected_pruned={expected_pruned_count} expected_kept={expected_kept_seq_length} "
+                            f"shape_ok={shape_ok} pruned_within_vision={pruned_within_vision} "
+                            f"bos_preserved={bos_preserved} proprio_preserved={proprio_preserved} "
+                            f"post_tokens_preserved={post_tokens_preserved} fastv_k={fastv_k} fastv_r={fastv_r} "
+                            f"image_token_start_index={vision_start} image_token_length={vision_len} image_end={vision_end} "
+                            f"num_images_in_input={num_images_in_input} patches_per_image={patches_per_image} "
+                            f"num_keep_per_image={num_keep_per_image}",
+                            log_file,
+                        )
+                        if remap_info is not None:
+                            log_message(
+                                f"[PADI-OFT FastV-ActionRemap] step={t} "
+                                f"original_start={remap_info.get('original_action_start')} "
+                                f"new_start={remap_info.get('new_action_start')} "
+                                f"shift={remap_info.get('action_shift')} "
+                                f"count={remap_info.get('action_token_count')} "
+                                f"preserved={remap_info.get('action_positions_preserved')} "
+                                f"contiguous={remap_info.get('action_new_positions_contiguous')} "
+                                f"fallback={remap_info.get('fallback', False)}",
+                                log_file,
+                            )
+                        if cfg.fastv_sanity_assert:
+                            if skipped:
+                                raise RuntimeError(f"FastV sanity assert failed: skipped=True reason={skip_reason}")
+                            if not shape_ok:
+                                raise RuntimeError("FastV sanity assert failed: shape_ok=False")
+                            if not pruned_within_vision:
+                                raise RuntimeError("FastV sanity assert failed: pruned_within_vision=False")
+                            if not bos_preserved:
+                                raise RuntimeError("FastV sanity assert failed: bos_preserved=False")
+                            if not post_tokens_preserved:
+                                raise RuntimeError("FastV sanity assert failed: post_tokens_preserved=False")
+                            if cfg.use_proprio and not proprio_preserved:
+                                raise RuntimeError("FastV sanity assert failed: proprio_preserved=False")
+                            if remap_info is not None and not remap_info.get("action_positions_preserved", False):
+                                raise RuntimeError("FastV sanity assert failed: action_positions_preserved=False")
                 action_queue.extend(actions)
 
             # Get action from queue
@@ -437,8 +538,19 @@ def run_episode(
                         log_file,
                     )
 
-            frame_for_video = get_libero_image(obs)
-            if cfg.use_padi_runtime and cfg.padi_video_overlay:
+            if cfg.fastv_video_overlay:
+                # FastV overlay takes priority over PADI overlay to keep visuals clean.
+                frame_for_video = overlay_fastv_pruning_on_views(
+                    observation["full_image"],
+                    observation["wrist_image"],
+                    latest_fastv_pruning_info,
+                    alpha=cfg.fastv_overlay_alpha,
+                    show_label=cfg.fastv_overlay_label,
+                )
+            else:
+                frame_for_video = get_libero_image(obs)
+
+            if (not cfg.fastv_video_overlay) and cfg.use_padi_runtime and cfg.padi_video_overlay:
                 frame_for_video = overlay_padi_scores_on_frame(
                     frame_for_video, padi_out if eef_pos is not None else None, t, position=cfg.padi_overlay_position
                 )

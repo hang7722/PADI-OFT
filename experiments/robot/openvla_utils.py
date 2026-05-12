@@ -296,6 +296,25 @@ def get_vla(cfg: Any) -> torch.nn.Module:
     # Set number of images in model input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
 
+    # PADI-OFT FastV Stage-2: propagate runtime FastV config to model + model.config
+    vla.use_fastv = cfg.use_fastv
+    vla.fastv_k = cfg.fastv_k
+    vla.fastv_r = cfg.fastv_r
+    vla.fastv_image_token_start_index = cfg.fastv_image_token_start_index
+    vla.fastv_image_token_length = cfg.fastv_image_token_length
+    vla.fastv_patches_per_image = cfg.fastv_patches_per_image
+    vla.fastv_num_images_in_input = cfg.num_images_in_input
+    vla.fastv_debug = cfg.fastv_debug
+    if hasattr(vla, "config"):
+        vla.config.use_fastv = cfg.use_fastv
+        vla.config.fastv_k = cfg.fastv_k
+        vla.config.fastv_r = cfg.fastv_r
+        vla.config.fastv_image_token_start_index = cfg.fastv_image_token_start_index
+        vla.config.fastv_image_token_length = cfg.fastv_image_token_length
+        vla.config.fastv_patches_per_image = cfg.fastv_patches_per_image
+        vla.config.fastv_num_images_in_input = cfg.num_images_in_input
+        vla.config.fastv_debug = cfg.fastv_debug
+
     vla.eval()
 
     # Move model to device if not using quantization

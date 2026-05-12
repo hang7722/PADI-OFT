@@ -1107,6 +1107,207 @@ class LlamaModel(LlamaPreTrainedModel):
             attentions=all_self_attns,
         )
 
+    # PADI-OFT FastV Stage-1
+    def fastv_forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        fastv_config: Optional[dict] = None,
+    ) -> Union[Tuple, BaseModelOutputWithPast]:
+        if not fastv_config or not fastv_config.get("use_fastv", False):
+            self.pruning_info = {"skipped": True, "skip_reason": "fastv_disabled"}
+            return self.forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                cache_position=cache_position,
+            )
+
+        output_attentions_user = output_attentions
+        output_attentions = True
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one")
+        if self.gradient_checkpointing and self.training and use_cache:
+            logger.warning_once("`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`.")
+            use_cache = False
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        past_seen_tokens = 0
+        if use_cache:
+            if not isinstance(past_key_values, StaticCache):
+                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+                past_seen_tokens = past_key_values.get_seq_length()
+
+        if cache_position is None:
+            if isinstance(past_key_values, StaticCache):
+                raise ValueError("cache_position is a required argument when using StaticCache.")
+            cache_position = torch.arange(past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device)
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_seen_tokens)
+        hidden_states = inputs_embeds
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = ()
+        next_decoder_cache = None
+        original_seq_length = hidden_states.shape[1]
+
+        fastv_k = int(fastv_config.get("fastv_k", 3))
+        fastv_r = float(fastv_config.get("fastv_r", 0.5))
+        image_token_start_index = int(fastv_config.get("image_token_start_index", 1))
+        image_token_length = int(fastv_config.get("image_token_length", 512))
+        num_images_in_input = int(fastv_config.get("num_images_in_input", 2))
+        patches_per_image = int(fastv_config.get("patches_per_image", image_token_length // max(num_images_in_input, 1)))
+        pruning_info = {
+            "original_seq_length": int(original_seq_length),
+            "kept_seq_length": int(original_seq_length),
+            "image_token_start_index": image_token_start_index,
+            "image_token_length": image_token_length,
+            "num_images_in_input": num_images_in_input,
+            "patches_per_image": patches_per_image,
+            "fastv_k": fastv_k,
+            "fastv_r": fastv_r,
+            "pruning_layer": None,
+            "kept_indices": None,
+            "pruned_indices": None,
+            "kept_vision_indices_by_image": [],
+            "num_keep_per_image": [],
+            "skipped": True,
+            "skip_reason": "not_reached",
+        }
+
+        for layer_idx, decoder_layer in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=True,
+                use_cache=use_cache,
+                cache_position=cache_position,
+            )
+            hidden_states = layer_outputs[0]
+            layer_attn = layer_outputs[1]
+            all_self_attns += (layer_attn,)
+
+            if use_cache:
+                next_decoder_cache = layer_outputs[2]
+
+            # PADI-OFT FastV Stage-1
+            if layer_idx == fastv_k and pruning_info["pruning_layer"] is None:
+                seq_len = hidden_states.shape[1]
+                batch_size = hidden_states.shape[0]
+                skip_reason = None
+                if seq_len <= 1:
+                    skip_reason = "seq_len_too_short"
+                elif layer_attn is None:
+                    skip_reason = "attention_unavailable"
+                elif batch_size != 1:
+                    skip_reason = "batch_size_not_supported"
+                elif num_images_in_input <= 0:
+                    skip_reason = "invalid_num_images_in_input"
+                elif image_token_start_index < 0 or image_token_length <= 0:
+                    skip_reason = "invalid_image_layout"
+                elif image_token_start_index + image_token_length > seq_len:
+                    skip_reason = "image_range_out_of_bounds"
+                elif image_token_length % num_images_in_input != 0 and "patches_per_image" not in fastv_config:
+                    skip_reason = "non_divisible_image_token_length"
+                if skip_reason is None:
+                    attn_avg = layer_attn.mean(dim=1)[0]
+                    image_end = image_token_start_index + image_token_length
+                    kept_vision_indices_by_image = []
+                    num_keep_per_image = []
+                    selected_vision_indices = []
+                    for img_idx in range(num_images_in_input):
+                        seg_start = image_token_start_index + img_idx * patches_per_image
+                        seg_end = min(seg_start + patches_per_image, image_end)
+                        if seg_start >= seg_end:
+                            continue
+                        score_i = attn_avg[-1, seg_start:seg_end]
+                        num_keep_i = int(round((seg_end - seg_start) * (1.0 - fastv_r)))
+                        num_keep_i = max(1, min(num_keep_i, seg_end - seg_start))
+                        local_topk = score_i.topk(num_keep_i).indices + seg_start
+                        kept_vision_indices_by_image.append(local_topk.detach().cpu())
+                        num_keep_per_image.append(num_keep_i)
+                        selected_vision_indices.append(local_topk)
+
+                    pre_indices = torch.arange(0, image_token_start_index, device=hidden_states.device)
+                    post_indices = torch.arange(image_end, seq_len, device=hidden_states.device)
+                    selected_vision_indices = (
+                        torch.cat(selected_vision_indices) if selected_vision_indices else torch.empty(0, device=hidden_states.device, dtype=torch.long)
+                    )
+                    keep_indices = torch.cat([pre_indices, selected_vision_indices, post_indices]).unique().sort().values
+                    pruned_indices = torch.arange(seq_len, device=hidden_states.device)
+                    pruned_indices = pruned_indices[~torch.isin(pruned_indices, keep_indices)]
+
+                    hidden_states = hidden_states[:, keep_indices, :]
+                    if position_ids is not None:
+                        position_ids = keep_indices.unsqueeze(0).to(position_ids.device)
+                    if cache_position is not None:
+                        cache_position = keep_indices.to(cache_position.device)
+                    if causal_mask is not None:
+                        if causal_mask.dim() == 2:
+                            causal_mask = causal_mask[:, keep_indices]
+                        elif causal_mask.dim() == 4:
+                            causal_mask = causal_mask[:, :, keep_indices, :][:, :, :, keep_indices]
+                    pruning_info.update(
+                        {
+                            "kept_seq_length": int(hidden_states.shape[1]),
+                            "pruning_layer": int(layer_idx),
+                            "kept_indices": keep_indices.detach().cpu(),
+                            "pruned_indices": pruned_indices.detach().cpu(),
+                            "kept_vision_indices_by_image": kept_vision_indices_by_image,
+                            "num_keep_per_image": num_keep_per_image,
+                            "skipped": False,
+                            "skip_reason": None,
+                        }
+                    )
+                else:
+                    pruning_info["pruning_layer"] = int(layer_idx)
+                    pruning_info["skip_reason"] = skip_reason
+
+        hidden_states = self.norm(hidden_states)
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        next_cache = None
+        if use_cache:
+            next_cache = next_decoder_cache.to_legacy_cache() if isinstance(next_decoder_cache, Cache) else next_decoder_cache
+        self.pruning_info = pruning_info
+
+        if not return_dict:
+            attn_out = all_self_attns if output_attentions_user else None
+            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, attn_out] if v is not None)
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=next_cache,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns if output_attentions_user else None,
+        )
+
     def _update_causal_mask(
         self,
         attention_mask: torch.Tensor,
@@ -1298,6 +1499,69 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    # PADI-OFT FastV Stage-1
+    def fastv_forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        fastv_config: Optional[dict] = None,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.model.fastv_forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+            fastv_config=fastv_config,
+        )
+        hidden_states = outputs[0]
+        if self.config.pretraining_tp > 1:
+            lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
+            logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
+            logits = torch.cat(logits, dim=-1)
+        else:
+            logits = self.lm_head(hidden_states)
+        logits = logits.float()
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss_fct = CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            shift_labels = shift_labels.view(-1).to(shift_logits.device)
+            loss = loss_fct(shift_logits, shift_labels)
+
+        self.pruning_info = getattr(self.model, "pruning_info", None)
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
