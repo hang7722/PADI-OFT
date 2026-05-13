@@ -7,6 +7,7 @@ but exactly replicate the logic in `prismatic.models.vlms.prismatic.py`.
 """
 
 import logging
+import time
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, Union
@@ -39,6 +40,11 @@ from .configuration_prismatic import OpenVLAConfig, PrismaticConfig
 
 # Set up logger
 logger = logging.getLogger(__name__)
+
+
+def _cuda_sync_if_available() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 # === Utility Functions for Monkey-Patching ===
@@ -739,8 +745,13 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
     # PADI-OFT FastV Stage-2
     def _maybe_fastv_language_model_forward(self, **kwargs):
         self.pruning_info = None
+        self.last_llm_latency_ms = None
         fastv_config = self._build_fastv_config()
         used_fastv = False
+        measure_latency = bool(getattr(self, "measure_latency", getattr(self.config, "measure_latency", False)))
+        if measure_latency:
+            _cuda_sync_if_available()
+            t0 = time.perf_counter()
         if kwargs.get("labels", None) is not None:
             out = self.language_model(**kwargs)
         elif fastv_config["use_fastv"] and hasattr(self.language_model, "fastv_forward"):
@@ -748,6 +759,10 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             used_fastv = True
         else:
             out = self.language_model(**kwargs)
+        if measure_latency:
+            _cuda_sync_if_available()
+            t1 = time.perf_counter()
+            self.last_llm_latency_ms = float((t1 - t0) * 1000.0)
         if used_fastv and hasattr(self.language_model, "pruning_info"):
             self.pruning_info = self.language_model.pruning_info
             if getattr(self, "fastv_debug", getattr(self.config, "fastv_debug", False)) and self.pruning_info is not None:

@@ -315,6 +315,14 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         vla.config.fastv_num_images_in_input = cfg.num_images_in_input
         vla.config.fastv_debug = cfg.fastv_debug
 
+    vla.measure_latency = cfg.measure_latency
+    vla.latency_warmup_queries = cfg.latency_warmup_queries
+    vla.latency_log_per_query = cfg.latency_log_per_query
+    if hasattr(vla, "config"):
+        vla.config.measure_latency = cfg.measure_latency
+        vla.config.latency_warmup_queries = cfg.latency_warmup_queries
+        vla.config.latency_log_per_query = cfg.latency_log_per_query
+
     vla.eval()
 
     # Move model to device if not using quantization

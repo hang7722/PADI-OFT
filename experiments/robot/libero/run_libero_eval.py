@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import sys
+import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -19,6 +20,7 @@ from padi_oft.runtime.gsdr_controller import PadiGSDRConfig, PadiGSDRController
 
 import draccus
 import numpy as np
+import torch
 import tqdm
 from libero.libero import benchmark
 from padi_oft.runtime.video_overlay import overlay_fastv_pruning_on_views, overlay_padi_scores_on_frame
@@ -80,6 +82,11 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
+
+
+def _cuda_sync_if_available() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 @dataclass
@@ -153,6 +160,10 @@ class GenerateConfig:
     fastv_video_overlay: bool = False               # Overlay FastV pruning mask on dual-view rollout frames
     fastv_overlay_alpha: int = 170                  # Dark mask strength for pruned FastV patches
     fastv_overlay_label: bool = True                # Show tiny "Global/Wrist/FastV mask" labels
+
+    measure_latency: bool = False                    # Enable latency telemetry (policy query + LLM forward)
+    latency_warmup_queries: int = 3                 # Number of initial policy queries excluded from summary
+    latency_log_per_query: bool = False             # Print one-line latency per policy query
 
     # fmt: on
 
@@ -323,6 +334,19 @@ def process_action(action, model_family):
     return action
 
 
+def _get_latency_mode(cfg: GenerateConfig) -> str:
+    modes = []
+    if getattr(cfg, "use_fastv", False):
+        modes.append(f"fastv_r{cfg.fastv_r}_k{cfg.fastv_k}")
+    if getattr(cfg, "gsdr", False):
+        modes.append("gsdr")
+    if getattr(cfg, "use_padi_runtime", False):
+        modes.append("padi_runtime")
+    if not modes:
+        return "baseline"
+    return "+".join(modes)
+
+
 def run_episode(
     cfg: GenerateConfig,
     env,
@@ -362,6 +386,8 @@ def run_episode(
 
     padi_episode_telemetry = []
     latest_fastv_pruning_info = None
+    latency_records = []
+    policy_query_idx = 0
 
     # Run episode
     success = False
@@ -379,6 +405,9 @@ def run_episode(
             # If action queue is empty, requery model
             if len(action_queue) == 0:
                 # Query model to get action
+                if cfg.measure_latency:
+                    _cuda_sync_if_available()
+                    policy_t0 = time.perf_counter()
                 actions = get_action(
                     cfg,
                     model,
@@ -390,7 +419,47 @@ def run_episode(
                     noisy_action_projector=noisy_action_projector,
                     use_film=cfg.use_film,
                 )
+                if cfg.measure_latency:
+                    _cuda_sync_if_available()
+                    policy_t1 = time.perf_counter()
+                    policy_query_latency_ms = float((policy_t1 - policy_t0) * 1000.0)
+                else:
+                    policy_query_latency_ms = None
                 latest_fastv_pruning_info = getattr(model, "last_pruning_info", None)
+                llm_latency_ms = getattr(model, "last_llm_latency_ms", None)
+                if cfg.measure_latency:
+                    record = {
+                        "query_idx": policy_query_idx,
+                        "step": t,
+                        "policy_query_latency_ms": policy_query_latency_ms,
+                        "llm_forward_latency_ms": llm_latency_ms,
+                        "use_fastv": cfg.use_fastv,
+                        "fastv_r": cfg.fastv_r if cfg.use_fastv else None,
+                        "fastv_k": cfg.fastv_k if cfg.use_fastv else None,
+                    }
+                    if latest_fastv_pruning_info is not None:
+                        for k in [
+                            "original_seq_length",
+                            "kept_seq_length",
+                            "pruned_count",
+                            "num_keep_per_image",
+                            "skipped",
+                            "skip_reason",
+                            "pruned_indices",
+                        ]:
+                            if k in latest_fastv_pruning_info:
+                                record[k] = latest_fastv_pruning_info[k]
+                    latency_records.append(record)
+                    if cfg.latency_log_per_query:
+                        kept = record.get("kept_seq_length", None)
+                        pruned = record.get("pruned_count", None)
+                        log_message(
+                            f"[PADI-OFT Latency-Query] step={t} query={policy_query_idx} "
+                            f"policy_ms={policy_query_latency_ms:.3f} llm_ms={llm_latency_ms} "
+                            f"use_fastv={cfg.use_fastv} kept={kept} pruned={pruned}",
+                            log_file,
+                        )
+                    policy_query_idx += 1
                 should_run_fastv_sanity = cfg.use_fastv and (cfg.fastv_debug or cfg.fastv_sanity_assert)
                 if should_run_fastv_sanity:
                     pruning_info = getattr(model, "last_pruning_info", None)
@@ -567,7 +636,7 @@ def run_episode(
     except Exception as e:
         log_message(f"Episode error: {e}", log_file)
 
-    return success, replay_images, padi_episode_telemetry
+    return success, replay_images, padi_episode_telemetry, latency_records
 
 
 def run_task(
@@ -598,6 +667,7 @@ def run_task(
 
     # Start episodes
     task_episodes, task_successes = 0, 0
+    task_latency_records = []
     for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
         log_message(f"\nTask: {task_description}", log_file)
 
@@ -626,7 +696,7 @@ def run_task(
         if gsdr_controller is not None:
             gsdr_controller.reset()
 
-        success, replay_images, padi_episode_telemetry = run_episode(
+        success, replay_images, padi_episode_telemetry, latency_records = run_episode(
             cfg,
             env,
             task_description,
@@ -641,6 +711,9 @@ def run_task(
             padi_runtime,
             gsdr_controller,
         )
+
+        if cfg.measure_latency:
+            task_latency_records.extend(latency_records)
 
         # Update counters
         task_episodes += 1
@@ -658,6 +731,70 @@ def run_task(
         log_message(f"Success: {success}", log_file)
         log_message(f"# episodes completed so far: {total_episodes}", log_file)
         log_message(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)", log_file)
+
+    if cfg.measure_latency and task_latency_records:
+        warmup = max(int(cfg.latency_warmup_queries), 0)
+        valid_records = [r for r in task_latency_records if int(r.get("query_idx", 0)) >= warmup]
+        warmup_fallback = False
+        if len(valid_records) == 0:
+            valid_records = task_latency_records
+            warmup_fallback = True
+
+        policy_vals = [r.get("policy_query_latency_ms") for r in valid_records if r.get("policy_query_latency_ms") is not None]
+        llm_vals = [r.get("llm_forward_latency_ms") for r in valid_records if r.get("llm_forward_latency_ms") is not None]
+
+        policy_mean = float(np.mean(policy_vals)) if policy_vals else float("nan")
+        policy_p50 = float(np.median(policy_vals)) if policy_vals else float("nan")
+        policy_p90 = float(np.percentile(policy_vals, 90)) if policy_vals else float("nan")
+        llm_mean = float(np.mean(llm_vals)) if llm_vals else float("nan")
+        llm_p50 = float(np.median(llm_vals)) if llm_vals else float("nan")
+        llm_p90 = float(np.percentile(llm_vals, 90)) if llm_vals else float("nan")
+
+        token_orig_vals, token_kept_vals, token_pruned_vals, keep_ratio_vals = [], [], [], []
+        for r in valid_records:
+            original = r.get("original_seq_length")
+            kept = r.get("kept_seq_length")
+            if original is None or kept is None:
+                continue
+            try:
+                original_f = float(original)
+                kept_f = float(kept)
+            except (TypeError, ValueError):
+                continue
+            if original_f <= 0:
+                continue
+            pruned = r.get("pruned_count")
+            if pruned is None and r.get("pruned_indices") is not None:
+                pruned_indices = r.get("pruned_indices")
+                pruned = len(pruned_indices.tolist()) if hasattr(pruned_indices, "tolist") else len(pruned_indices)
+            if pruned is None:
+                pruned = original_f - kept_f
+            token_orig_vals.append(original_f)
+            token_kept_vals.append(kept_f)
+            token_pruned_vals.append(float(pruned))
+            keep_ratio_vals.append(kept_f / original_f)
+
+        if token_orig_vals and token_kept_vals and token_pruned_vals and keep_ratio_vals:
+            token_orig = f"{float(np.mean(token_orig_vals)):.3f}"
+            token_kept = f"{float(np.mean(token_kept_vals)):.3f}"
+            token_pruned = f"{float(np.mean(token_pruned_vals)):.3f}"
+            token_keep_ratio = f"{float(np.mean(keep_ratio_vals)):.4f}"
+        else:
+            token_orig = "NA"
+            token_kept = "NA"
+            token_pruned = "NA"
+            token_keep_ratio = "NA"
+
+        log_message(
+            "[PADI-OFT Latency] "
+            f"scope=task task_id={task_id} task=\"{task_description}\" mode={_get_latency_mode(cfg)} episodes={task_episodes} "
+            f"queries={len(task_latency_records)} measured={len(valid_records)} warmup={warmup} "
+            f"warmup_fallback={warmup_fallback} "
+            f"policy_ms_mean={policy_mean:.3f} policy_ms_p50={policy_p50:.3f} policy_ms_p90={policy_p90:.3f} "
+            f"llm_ms_mean={llm_mean:.3f} llm_ms_p50={llm_p50:.3f} llm_ms_p90={llm_p90:.3f} "
+            f"token_orig={token_orig} token_kept={token_kept} token_pruned={token_pruned} token_keep_ratio={token_keep_ratio}",
+            log_file,
+        )
 
     # Log task results
     task_success_rate = float(task_successes) / float(task_episodes) if task_episodes > 0 else 0
