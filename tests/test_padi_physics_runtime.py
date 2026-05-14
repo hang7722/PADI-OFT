@@ -219,9 +219,9 @@ def test_defaults_align_source_of_truth():
     assert cfg.precise_curvature_thresh == 0.12
     assert cfg.precise_entry_steps == 1
     assert cfg.precise_exit_steps == 4
-    assert cfg.local_total_speed_thresh == 0.006
-    assert cfg.local_xy_speed_thresh == 0.0045
-    assert cfg.local_z_speed_thresh == 0.0025
+    assert cfg.local_total_speed_thresh == 0.014
+    assert cfg.local_xy_speed_thresh == 0.0075
+    assert cfg.local_z_speed_thresh == 0.013
     assert cfg.gripper_close_score_thresh == 0.45
     assert cfg.gripper_open_score_thresh == 0.20
 
@@ -235,37 +235,11 @@ def test_first_frame_and_reset_behavior_source_truth():
     assert rt.state.last_eef_pos is None
 
 
-def test_legacy_defaults_unchanged():
+def test_final_oft_calibrated_defaults():
     cfg = PadiPhysicsConfig()
-    assert cfg.geometry_curve_offset == 0.08
-    assert cfg.geometry_slow_total_base == 0.012
-    assert cfg.local_total_speed_thresh == 0.006
-
-
-def test_oft_calibrated_profile_is_more_sensitive_than_legacy():
-    legacy = PadiPhysicsAwareRuntime(PadiPhysicsConfig())
-    oft = PadiPhysicsAwareRuntime(PadiPhysicsConfig.oft_calibrated())
-
-    seq = [[0.0, 0.0, 0.0], [0.004, 0.003, 0.001], [0.007, 0.005, 0.0015]]
-    out_l = out_o = None
-    for p in seq:
-        out_l = legacy.update(p, gripper_value=0.0)
-        out_o = oft.update(p, gripper_value=0.0)
-
-    assert out_l is not None and out_o is not None
-    assert out_o.geometry_risk >= out_l.geometry_risk
-
-
-def test_oft_calibrated_v2_profile_more_sensitive_than_v1():
-    v1 = PadiPhysicsAwareRuntime(PadiPhysicsConfig.oft_calibrated())
-    v2 = PadiPhysicsAwareRuntime(PadiPhysicsConfig.oft_calibrated_v2())
-    seq = [[0.0, 0.0, 0.0], [0.004, 0.003, 0.001], [0.007, 0.005, 0.0015]]
-    out1 = out2 = None
-    for p in seq:
-        out1 = v1.update(p, gripper_value=0.0)
-        out2 = v2.update(p, gripper_value=0.0)
-    assert out1 is not None and out2 is not None
-    assert out2.geometry_risk >= out1.geometry_risk
+    assert cfg.geometry_curve_offset == 0.015
+    assert cfg.geometry_slow_total_base == 0.018
+    assert cfg.local_total_speed_thresh == 0.014
 
 
 def test_overlay_helper_returns_same_shape_dtype():
@@ -313,18 +287,6 @@ def test_overlay_helper_handles_precise_debug():
     assert not np.array_equal(over, frame)
 
 
-def test_oft_calibrated_v3_profile_more_sensitive_than_v2():
-    v2 = PadiPhysicsAwareRuntime(PadiPhysicsConfig.oft_calibrated_v2())
-    v3 = PadiPhysicsAwareRuntime(PadiPhysicsConfig.oft_calibrated_v3())
-    seq = [[0.0, 0.0, 0.0], [0.004, 0.003, 0.001], [0.007, 0.005, 0.0015]]
-    out2 = out3 = None
-    for p in seq:
-        out2 = v2.update(p, gripper_value=0.0)
-        out3 = v3.update(p, gripper_value=0.0)
-    assert out2 is not None and out3 is not None
-    assert out3.geometry_risk >= out2.geometry_risk
-
-
 def test_overlay_helper_supports_positions():
     frame = np.zeros((96, 128, 3), dtype=np.uint8)
     out = PadiSignalOutput(geometry_risk=0.3, precise_active=False, transit_score=0.5, debug={})
@@ -334,12 +296,11 @@ def test_overlay_helper_supports_positions():
         assert over.dtype == np.uint8
 
 
-def test_legacy_v1_v2_defaults_unchanged():
-    legacy = PadiPhysicsConfig()
-    v1 = PadiPhysicsConfig.oft_calibrated()
-    v2 = PadiPhysicsConfig.oft_calibrated_v2()
-    v3 = PadiPhysicsConfig.oft_calibrated_v3()
-    assert legacy.local_total_speed_thresh == 0.006
-    assert v1.local_total_speed_thresh == 0.009
-    assert v2.local_total_speed_thresh == 0.012
-    assert v3.local_total_speed_thresh == 0.014
+def test_runtime_runs_with_final_default_profile():
+    rt = PadiPhysicsAwareRuntime(PadiPhysicsConfig())
+    seq = [[0.0, 0.0, 0.0], [0.004, 0.003, 0.001], [0.007, 0.005, 0.0015]]
+    out = None
+    for p in seq:
+        out = rt.update(p, gripper_value=0.0)
+    assert out is not None
+    assert 0.0 <= out.geometry_risk <= 1.0

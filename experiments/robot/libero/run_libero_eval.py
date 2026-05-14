@@ -140,13 +140,17 @@ class GenerateConfig:
 
     use_padi_runtime: bool = False                   # Enable PADI phase-1 physics runtime telemetry
     padi_debug: bool = False                         # Print per-step PADI signals when runtime is enabled
-    padi_profile: str = "legacy"                    # PADI runtime profile: legacy or oft_calibrated
     padi_video_overlay: bool = False                # Overlay PADI scores on rollout MP4 frames when enabled
     padi_overlay_position: str = "top_left"         # Overlay position: top_left/top_right/bottom_left/bottom_right
 
     gsdr: bool = False                               # Enable GSDR geometry-risk-only budget telemetry
     gsdr_debug: bool = False                         # Print per-step GSDR budget telemetry
-    gsdr_base_keep_ratio: float = 0.50              # Simulated FastV base keep ratio before FastV integration
+    gsdr_base_keep_ratio: float = 0.25              # Base keep ratio under low geometry risk
+    gsdr_max_keep_ratio: float = 0.75               # Max keep ratio before entering no-prune mode
+    gsdr_g_low: float = 0.25                        # Risk <= g_low uses gsdr_base_keep_ratio
+    gsdr_g_no_prune: float = 0.95                   # Risk >= g_no_prune forces no-prune
+    gsdr_geometry_ema_alpha: float = 0.65           # EMA alpha for geometry risk smoothing
+    gsdr_token_quantum: int = 2                     # Keep-token quantization quantum
     gsdr_num_patches_per_image: int = 256           # Simulated per-image vision patch token count before FastV integration
 
     use_fastv: bool = False                         # Enable FastV Stage-2 call chain
@@ -181,8 +185,18 @@ def validate_config(cfg: GenerateConfig) -> None:
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
 
     if cfg.gsdr:
-        assert cfg.use_padi_runtime, "--gsdr=True requires --use_padi_runtime=True"
+        if not cfg.use_padi_runtime:
+            logger.warning("[GSDR] --gsdr=True automatically enables --use_padi_runtime=True")
+            cfg.use_padi_runtime = True
+        if not cfg.use_fastv:
+            logger.warning("[GSDR] --gsdr=True automatically enables --use_fastv=True")
+            cfg.use_fastv = True
+        cfg.fastv_r = 1.0 - float(cfg.gsdr_base_keep_ratio)
         assert 0.0 < cfg.gsdr_base_keep_ratio <= 1.0
+        assert cfg.gsdr_base_keep_ratio <= cfg.gsdr_max_keep_ratio <= 1.0
+        assert 0.0 <= cfg.gsdr_g_low < cfg.gsdr_g_no_prune <= 1.0
+        assert 0.0 < cfg.gsdr_geometry_ema_alpha <= 1.0
+        assert cfg.gsdr_token_quantum >= 1
         assert cfg.gsdr_num_patches_per_image > 0
 
     assert 0.0 <= cfg.fastv_r < 1.0, "fastv_r must satisfy 0.0 <= fastv_r < 1.0"
@@ -280,6 +294,93 @@ def log_message(message: str, log_file=None):
         log_file.flush()
 
 
+def log_run_configuration(cfg: GenerateConfig, log_file=None):
+    action_mode = "l1_regression" if cfg.use_l1_regression else ("diffusion" if cfg.use_diffusion else "other")
+    log_message(
+        f"[PADI-OFT Config] task_suite={cfg.task_suite_name} checkpoint={cfg.pretrained_checkpoint} "
+        f"trials_per_task={cfg.num_trials_per_task} seed={cfg.seed}",
+        log_file,
+    )
+    log_message(
+        f"[PADI-OFT Config] action_mode={action_mode} use_diffusion={cfg.use_diffusion} use_film={cfg.use_film} "
+        f"num_images={cfg.num_images_in_input} use_proprio={cfg.use_proprio} center_crop={cfg.center_crop}",
+        log_file,
+    )
+
+    active_modules = []
+    if cfg.use_padi_runtime:
+        active_modules.append("padi")
+    if cfg.use_fastv:
+        active_modules.append("fastv")
+    if cfg.gsdr:
+        active_modules.append("gsdr")
+    if cfg.measure_latency:
+        active_modules.append("latency")
+    if cfg.fastv_video_overlay:
+        active_modules.append("fastv_video_overlay")
+    if cfg.padi_video_overlay:
+        active_modules.append("padi_video_overlay")
+    log_message(
+        f"[PADI-OFT Config] active_modules={','.join(active_modules) if active_modules else 'baseline'}",
+        log_file,
+    )
+
+    if cfg.use_padi_runtime:
+        log_message(
+            f"[PADI-OFT Config][PADI] profile=final_oft_calibrated debug={cfg.padi_debug} "
+            f"video_overlay={cfg.padi_video_overlay} overlay_position={cfg.padi_overlay_position}",
+            log_file,
+        )
+
+    if cfg.use_fastv:
+        if cfg.gsdr:
+            initial_fastv_r = 1.0 - float(cfg.gsdr_base_keep_ratio)
+            log_message(
+                f"[PADI-OFT Config][FastV] mode=dynamic_by_gsdr fastv_k={cfg.fastv_k} "
+                f"initial_fastv_r={initial_fastv_r:.4f} image_start={cfg.fastv_image_token_start_index} "
+                f"image_length={cfg.fastv_image_token_length} patches_per_image={cfg.fastv_patches_per_image} "
+                f"num_images={cfg.num_images_in_input} debug={cfg.fastv_debug} sanity_assert={cfg.fastv_sanity_assert}",
+                log_file,
+            )
+        else:
+            log_message(
+                f"[PADI-OFT Config][FastV] mode=fixed fastv_k={cfg.fastv_k} fastv_r={cfg.fastv_r:.4f} "
+                f"image_start={cfg.fastv_image_token_start_index} image_length={cfg.fastv_image_token_length} "
+                f"patches_per_image={cfg.fastv_patches_per_image} num_images={cfg.num_images_in_input} "
+                f"debug={cfg.fastv_debug} sanity_assert={cfg.fastv_sanity_assert}",
+                log_file,
+            )
+
+    if cfg.gsdr:
+        log_message(
+            f"[PADI-OFT Config][GSDR] base_keep={cfg.gsdr_base_keep_ratio:.4f} max_keep={cfg.gsdr_max_keep_ratio:.4f} "
+            f"g_low={cfg.gsdr_g_low:.4f} g_no_prune={cfg.gsdr_g_no_prune:.4f} "
+            f"ema_alpha={cfg.gsdr_geometry_ema_alpha:.4f} token_quantum={cfg.gsdr_token_quantum} "
+            f"num_vision_tokens={cfg.fastv_image_token_length} debug={cfg.gsdr_debug}",
+            log_file,
+        )
+
+    if cfg.measure_latency:
+        log_message(
+            f"[PADI-OFT Config][Latency] enabled=True warmup_queries={cfg.latency_warmup_queries} "
+            f"log_per_query={cfg.latency_log_per_query} mode={_get_latency_mode(cfg)}",
+            log_file,
+        )
+
+    if cfg.fastv_video_overlay and cfg.padi_video_overlay:
+        log_message(
+            "[PADI-OFT Config][Video] fastv_video_overlay=True padi_video_overlay=True effective=fastv",
+            log_file,
+        )
+    elif cfg.fastv_video_overlay:
+        log_message(
+            f"[PADI-OFT Config][FastV-Overlay] alpha={cfg.fastv_overlay_alpha} label={cfg.fastv_overlay_label}",
+            log_file,
+        )
+    elif cfg.padi_video_overlay:
+        log_message(f"[PADI-OFT Config][PADI-Overlay] position={cfg.padi_overlay_position}", log_file)
+
+
 def load_initial_states(cfg: GenerateConfig, task_suite, task_id: int, log_file=None):
     """Load initial states for the given task."""
     # Get default initial states
@@ -336,15 +437,58 @@ def process_action(action, model_family):
 
 def _get_latency_mode(cfg: GenerateConfig) -> str:
     modes = []
-    if getattr(cfg, "use_fastv", False):
-        modes.append(f"fastv_r{cfg.fastv_r}_k{cfg.fastv_k}")
     if getattr(cfg, "gsdr", False):
-        modes.append("gsdr")
+        modes.append(f"fastv_dynamic_gsdr_base{cfg.gsdr_base_keep_ratio}_max{cfg.gsdr_max_keep_ratio}_k{cfg.fastv_k}")
+    elif getattr(cfg, "use_fastv", False):
+        modes.append(f"fastv_r{cfg.fastv_r}_k{cfg.fastv_k}")
     if getattr(cfg, "use_padi_runtime", False):
         modes.append("padi_runtime")
     if not modes:
         return "baseline"
     return "+".join(modes)
+
+
+
+
+def _set_model_fastv_runtime_budget(model, prune_ratio, keep_ratio, source, gsdr_out=None, num_vision_tokens=None):
+    prune_ratio = float(np.clip(prune_ratio, 0.0, 1.0))
+    keep_ratio = float(np.clip(keep_ratio, 0.0, 1.0))
+
+    model.fastv_r = prune_ratio
+    model.runtime_fastv_r = prune_ratio
+    model.runtime_fastv_keep_ratio = keep_ratio
+    model.runtime_fastv_budget_source = source
+
+    if hasattr(model, "config"):
+        model.config.fastv_r = prune_ratio
+        model.config.runtime_fastv_r = prune_ratio
+        model.config.runtime_fastv_keep_ratio = keep_ratio
+        model.config.runtime_fastv_budget_source = source
+
+    if gsdr_out is not None:
+        model.last_gsdr_out = gsdr_out
+        model.last_gsdr_apply_info = {
+            "source": source,
+            "keep_ratio": keep_ratio,
+            "prune_ratio": prune_ratio,
+            "keep_tokens": int(gsdr_out.keep_tokens),
+            "num_vision_tokens": int(gsdr_out.num_vision_tokens),
+            "no_prune": bool(gsdr_out.no_prune),
+            "geometry_risk_smooth": float(gsdr_out.geometry_risk_smooth),
+            "g_raw": float(gsdr_out.g_raw),
+        }
+    else:
+        model.last_gsdr_out = None
+        num_vision_tokens = 0 if num_vision_tokens is None else int(num_vision_tokens)
+        keep_tokens = int(round(float(num_vision_tokens) * keep_ratio))
+        model.last_gsdr_apply_info = {
+            "source": source,
+            "keep_ratio": keep_ratio,
+            "prune_ratio": prune_ratio,
+            "keep_tokens": keep_tokens,
+            "num_vision_tokens": num_vision_tokens,
+            "no_prune": bool(keep_ratio >= 1.0),
+        }
 
 
 def run_episode(
@@ -380,12 +524,16 @@ def run_episode(
     action_queue = deque(maxlen=cfg.num_open_loop_steps)
 
     # Setup
+    model.last_gsdr_out = None
+    model.last_gsdr_apply_info = None
     t = 0
     replay_images = []
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
 
     padi_episode_telemetry = []
     latest_fastv_pruning_info = None
+    latest_gsdr_out = None
+    latest_gsdr_apply_info = None
     latency_records = []
     policy_query_idx = 0
 
@@ -404,6 +552,47 @@ def run_episode(
 
             # If action queue is empty, requery model
             if len(action_queue) == 0:
+                if cfg.gsdr:
+                    if latest_gsdr_out is None:
+                        keep_ratio = float(cfg.gsdr_base_keep_ratio)
+                        source = "gsdr_initial_base"
+                        gsdr_out_for_apply = None
+                    else:
+                        keep_ratio = float(latest_gsdr_out.keep_ratio)
+                        source = "gsdr"
+                        gsdr_out_for_apply = latest_gsdr_out
+
+                    dynamic_fastv_r = 1.0 - keep_ratio
+                    _set_model_fastv_runtime_budget(
+                        model,
+                        prune_ratio=dynamic_fastv_r,
+                        keep_ratio=keep_ratio,
+                        source=source,
+                        gsdr_out=gsdr_out_for_apply,
+                        num_vision_tokens=cfg.fastv_image_token_length,
+                    )
+                    latest_gsdr_apply_info = getattr(model, "last_gsdr_apply_info", None)
+                    if cfg.gsdr_debug:
+                        if gsdr_out_for_apply is None:
+                            log_message(
+                                f"[PADI-OFT GSDR-Apply] step={t} source={source} "
+                                f"keep_ratio={keep_ratio:.4f} prune_ratio={dynamic_fastv_r:.4f} "
+                                f"max_keep_ratio={cfg.gsdr_max_keep_ratio:.4f}",
+                                log_file,
+                            )
+                        else:
+                            log_message(
+                                f"[PADI-OFT GSDR-Apply] step={t} source={source} "
+                                f"keep_ratio={keep_ratio:.4f} prune_ratio={dynamic_fastv_r:.4f} "
+                                f"keep_tokens={int(gsdr_out_for_apply.keep_tokens)} "
+                                f"num_vision_tokens={int(gsdr_out_for_apply.num_vision_tokens)} "
+                                f"no_prune={bool(gsdr_out_for_apply.no_prune)} "
+                                f"g_raw={float(gsdr_out_for_apply.g_raw):.4f} "
+                                f"geometry_risk_smooth={float(gsdr_out_for_apply.geometry_risk_smooth):.4f} "
+                                f"max_keep_ratio={cfg.gsdr_max_keep_ratio:.4f}",
+                                log_file,
+                            )
+
                 # Query model to get action
                 if cfg.measure_latency:
                     _cuda_sync_if_available()
@@ -434,7 +623,7 @@ def run_episode(
                         "policy_query_latency_ms": policy_query_latency_ms,
                         "llm_forward_latency_ms": llm_latency_ms,
                         "use_fastv": cfg.use_fastv,
-                        "fastv_r": cfg.fastv_r if cfg.use_fastv else None,
+                        "fastv_r": getattr(model, "fastv_r", cfg.fastv_r) if cfg.use_fastv else None,
                         "fastv_k": cfg.fastv_k if cfg.use_fastv else None,
                     }
                     if latest_fastv_pruning_info is not None:
@@ -449,6 +638,18 @@ def run_episode(
                         ]:
                             if k in latest_fastv_pruning_info:
                                 record[k] = latest_fastv_pruning_info[k]
+                    gsdr_apply_info = getattr(model, "last_gsdr_apply_info", None)
+                    if gsdr_apply_info is not None:
+                        record.update({
+                            "gsdr_keep_ratio": gsdr_apply_info.get("keep_ratio"),
+                            "gsdr_prune_ratio": gsdr_apply_info.get("prune_ratio"),
+                            "gsdr_keep_tokens": gsdr_apply_info.get("keep_tokens"),
+                            "gsdr_num_vision_tokens": gsdr_apply_info.get("num_vision_tokens"),
+                            "gsdr_no_prune": gsdr_apply_info.get("no_prune"),
+                            "gsdr_geometry_risk_smooth": gsdr_apply_info.get("geometry_risk_smooth"),
+                            "gsdr_g_raw": gsdr_apply_info.get("g_raw"),
+                            "gsdr_source": gsdr_apply_info.get("source"),
+                        })
                     latency_records.append(record)
                     if cfg.latency_log_per_query:
                         kept = record.get("kept_seq_length", None)
@@ -594,19 +795,29 @@ def run_episode(
 
             gsdr_out = None
             if gsdr_controller is not None and padi_out is not None:
-                num_vision_tokens = cfg.gsdr_num_patches_per_image * cfg.num_images_in_input
+                expected_vision_tokens = cfg.gsdr_num_patches_per_image * cfg.num_images_in_input
+                num_vision_tokens = cfg.fastv_image_token_length
+                if expected_vision_tokens != num_vision_tokens:
+                    logger.warning(
+                        "[GSDR] expected_vision_tokens (gsdr_num_patches_per_image*num_images_in_input) "
+                        f"!= fastv_image_token_length ({expected_vision_tokens} vs {num_vision_tokens}); "
+                        "using fastv_image_token_length for GSDR update."
+                    )
                 gsdr_out = gsdr_controller.update(
                     geometry_risk=padi_out.geometry_risk,
                     base_keep_ratio=cfg.gsdr_base_keep_ratio,
                     num_vision_tokens=num_vision_tokens,
                 )
+                latest_gsdr_out = gsdr_out
                 if cfg.gsdr_debug:
                     log_message(
                         f"[GSDR] step={t} g_raw={gsdr_out.g_raw:.4f} "
                         f"geometry_risk_smooth={gsdr_out.geometry_risk_smooth:.4f} "
                         f"keep_ratio_cont={gsdr_out.keep_ratio_cont:.4f} raw_keep_tokens={gsdr_out.raw_keep_tokens:.1f} "
                         f"base_keep_tokens={gsdr_out.base_keep_tokens} keep_ratio={gsdr_out.keep_ratio:.4f} "
-                        f"keep_tokens={gsdr_out.keep_tokens} no_prune={gsdr_out.no_prune}",
+                        f"keep_tokens={gsdr_out.keep_tokens} no_prune={gsdr_out.no_prune} "
+                        f"max_keep_ratio={gsdr_out.debug.get('max_keep_ratio')} "
+                        f"effective_max_keep_ratio={gsdr_out.debug.get('effective_max_keep_ratio')}",
                         log_file,
                     )
 
@@ -785,6 +996,20 @@ def run_task(
             token_pruned = "NA"
             token_keep_ratio = "NA"
 
+        gsdr_keep_ratio_vals = [float(r["gsdr_keep_ratio"]) for r in valid_records if r.get("gsdr_keep_ratio") is not None]
+        gsdr_prune_ratio_vals = [float(r["gsdr_prune_ratio"]) for r in valid_records if r.get("gsdr_prune_ratio") is not None]
+        gsdr_no_prune_vals = [1.0 if bool(r.get("gsdr_no_prune")) else 0.0 for r in valid_records if r.get("gsdr_no_prune") is not None]
+        gsdr_summary = ""
+        if gsdr_keep_ratio_vals:
+            gsdr_keep_ratio_mean = float(np.mean(gsdr_keep_ratio_vals))
+            gsdr_prune_ratio_mean = float(np.mean(gsdr_prune_ratio_vals)) if gsdr_prune_ratio_vals else float("nan")
+            gsdr_no_prune_rate = float(np.mean(gsdr_no_prune_vals)) if gsdr_no_prune_vals else float("nan")
+            gsdr_summary = (
+                f" gsdr_keep_ratio_mean={gsdr_keep_ratio_mean:.4f}"
+                f" gsdr_prune_ratio_mean={gsdr_prune_ratio_mean:.4f}"
+                f" gsdr_no_prune_rate={gsdr_no_prune_rate:.4f}"
+            )
+
         log_message(
             "[PADI-OFT Latency] "
             f"scope=task task_id={task_id} task=\"{task_description}\" mode={_get_latency_mode(cfg)} episodes={task_episodes} "
@@ -792,7 +1017,8 @@ def run_task(
             f"warmup_fallback={warmup_fallback} "
             f"policy_ms_mean={policy_mean:.3f} policy_ms_p50={policy_p50:.3f} policy_ms_p90={policy_p90:.3f} "
             f"llm_ms_mean={llm_mean:.3f} llm_ms_p50={llm_p50:.3f} llm_ms_p90={llm_p90:.3f} "
-            f"token_orig={token_orig} token_kept={token_kept} token_pruned={token_pruned} token_keep_ratio={token_keep_ratio}",
+            f"token_orig={token_orig} token_kept={token_kept} token_pruned={token_pruned} token_keep_ratio={token_keep_ratio}"
+            f"{gsdr_summary}",
             log_file,
         )
 
@@ -829,24 +1055,23 @@ def eval_libero(cfg: GenerateConfig) -> float:
 
     padi_runtime = None
     if cfg.use_padi_runtime:
-        if cfg.padi_profile == "legacy":
-            padi_config = PadiPhysicsConfig()
-        elif cfg.padi_profile == "oft_calibrated":
-            padi_config = PadiPhysicsConfig.oft_calibrated()
-        elif cfg.padi_profile == "oft_calibrated_v2":
-            padi_config = PadiPhysicsConfig.oft_calibrated_v2()
-        elif cfg.padi_profile == "oft_calibrated_v3":
-            padi_config = PadiPhysicsConfig.oft_calibrated_v3()
-        else:
-            raise ValueError(f"Unknown padi_profile: {cfg.padi_profile}")
+        padi_config = PadiPhysicsConfig()
         padi_runtime = PadiPhysicsAwareRuntime(padi_config)
-        logger.info(f"[PADI] using profile: {cfg.padi_profile}")
+        logger.info("[PADI] using final OFT-calibrated physics profile")
     if cfg.padi_debug and not cfg.use_padi_runtime:
         logger.warning("--padi_debug=True but --use_padi_runtime=False; PADI telemetry disabled.")
 
     gsdr_controller = None
     if cfg.gsdr:
-        gsdr_controller = PadiGSDRController(PadiGSDRConfig())
+        gsdr_controller = PadiGSDRController(
+            PadiGSDRConfig(
+                g_low=cfg.gsdr_g_low,
+                g_no_prune=cfg.gsdr_g_no_prune,
+                max_keep_ratio=cfg.gsdr_max_keep_ratio,
+                geometry_ema_alpha=cfg.gsdr_geometry_ema_alpha,
+                token_quantum=cfg.gsdr_token_quantum,
+            )
+        )
         logger.info("[GSDR] enabled: geometry-risk-only budget controller telemetry")
 
     # Get expected image dimensions
@@ -854,6 +1079,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
 
     # Setup logging
     log_file, local_log_filepath, run_id = setup_logging(cfg)
+    log_run_configuration(cfg, log_file)
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
