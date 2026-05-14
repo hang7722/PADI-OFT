@@ -14,14 +14,17 @@ def _smoothstep(x: float) -> float:
 
 @dataclass
 class PadiGSDRConfig:
-    g_low: float = 0.20
+    g_low: float = 0.25
     g_no_prune: float = 0.95
+    max_keep_ratio: float = 0.75
     geometry_ema_alpha: float = 0.65
     token_quantum: int = 2
     full_keep_only_on_no_prune: bool = True
 
     def __post_init__(self) -> None:
         assert 0.0 <= self.g_low < self.g_no_prune <= 1.0
+        assert 0.0 < self.max_keep_ratio <= 1.0
+        assert self.g_low < self.g_no_prune
         assert 0.0 < self.geometry_ema_alpha <= 1.0
         assert self.token_quantum >= 1
 
@@ -69,6 +72,8 @@ class PadiGSDRController:
 
         no_prune = g_raw >= c.g_no_prune or geometry_risk_smooth >= c.g_no_prune
 
+        effective_max_keep_ratio = max(base_keep_ratio, min(1.0, c.max_keep_ratio))
+
         if no_prune:
             keep_ratio_cont = 1.0
         elif geometry_risk_smooth <= c.g_low:
@@ -76,7 +81,7 @@ class PadiGSDRController:
         else:
             x = (geometry_risk_smooth - c.g_low) / (c.g_no_prune - c.g_low)
             boost = _smoothstep(x)
-            keep_ratio_cont = base_keep_ratio + (1.0 - base_keep_ratio) * boost
+            keep_ratio_cont = base_keep_ratio + (effective_max_keep_ratio - base_keep_ratio) * boost
 
         base_keep_tokens = int(math.ceil(num_vision_tokens * base_keep_ratio))
         raw_keep_tokens = num_vision_tokens * keep_ratio_cont
@@ -107,6 +112,8 @@ class PadiGSDRController:
             "no_prune": no_prune,
             "g_low": c.g_low,
             "g_no_prune": c.g_no_prune,
+            "max_keep_ratio": c.max_keep_ratio,
+            "effective_max_keep_ratio": effective_max_keep_ratio,
             "geometry_ema_alpha": c.geometry_ema_alpha,
             "token_quantum": c.token_quantum,
             "full_keep_only_on_no_prune": c.full_keep_only_on_no_prune,

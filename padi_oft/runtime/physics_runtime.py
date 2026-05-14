@@ -12,7 +12,7 @@ def _clamp01(x: float) -> float:
 
 @dataclass
 class PadiPhysicsConfig:
-    # Defaults are conservative and mapping-aligned; exact legacy defaults may vary by PADI-VLA branch.
+    # Default profile is the final OFT-calibrated PADI physics profile.
     precise_ratio_thresh: float = 1.3
     precise_speed_thresh: float = 0.85
     precise_total_speed_thresh: float = 0.75
@@ -20,9 +20,9 @@ class PadiPhysicsConfig:
     precise_entry_steps: int = 1
     precise_exit_steps: int = 4
 
-    local_total_speed_thresh: float = 0.006
-    local_xy_speed_thresh: float = 0.0045
-    local_z_speed_thresh: float = 0.0025
+    local_total_speed_thresh: float = 0.014
+    local_xy_speed_thresh: float = 0.0075
+    local_z_speed_thresh: float = 0.013
 
     gripper_close_score_thresh: float = 0.45
     gripper_engage_steps: int = 2
@@ -49,65 +49,16 @@ class PadiPhysicsConfig:
     short_window_size: int = 8
     geometry_dz_offset: float = 0.9
     geometry_dz_scale: float = 0.8
-    geometry_curve_offset: float = 0.08
-    geometry_curve_scale: float = 0.25
-    geometry_slow_total_base: float = 0.012
-    geometry_slow_total_scale: float = 0.010
-    geometry_slow_xy_base: float = 0.008
-    geometry_slow_xy_scale: float = 0.006
-    geometry_slow_recent_base: float = 0.010
-    geometry_slow_recent_scale: float = 0.008
+    geometry_curve_offset: float = 0.015
+    geometry_curve_scale: float = 0.18
+    geometry_slow_total_base: float = 0.018
+    geometry_slow_total_scale: float = 0.011
+    geometry_slow_xy_base: float = 0.013
+    geometry_slow_xy_scale: float = 0.007
+    geometry_slow_recent_base: float = 0.016
+    geometry_slow_recent_scale: float = 0.009
     geometry_precise_inactive_multiplier: float = 0.45
     geometry_suppression_cap: float = 0.15
-
-    @classmethod
-    def oft_calibrated(cls) -> "PadiPhysicsConfig":
-        cfg = cls()
-        cfg.local_total_speed_thresh = 0.009
-        cfg.local_xy_speed_thresh = 0.006
-        cfg.local_z_speed_thresh = 0.004
-        cfg.geometry_curve_offset = 0.05
-        cfg.geometry_curve_scale = 0.25
-        cfg.geometry_slow_total_base = 0.014
-        cfg.geometry_slow_total_scale = 0.010
-        cfg.geometry_slow_xy_base = 0.010
-        cfg.geometry_slow_xy_scale = 0.006
-        cfg.geometry_slow_recent_base = 0.012
-        cfg.geometry_slow_recent_scale = 0.008
-        return cfg
-
-    @classmethod
-    def oft_calibrated_v2(cls) -> "PadiPhysicsConfig":
-        cfg = cls()
-        cfg.local_total_speed_thresh = 0.012
-        cfg.local_xy_speed_thresh = 0.0065
-        cfg.local_z_speed_thresh = 0.011
-        cfg.geometry_curve_offset = 0.025
-        cfg.geometry_curve_scale = 0.20
-        cfg.geometry_slow_total_base = 0.016
-        cfg.geometry_slow_total_scale = 0.010
-        cfg.geometry_slow_xy_base = 0.012
-        cfg.geometry_slow_xy_scale = 0.006
-        cfg.geometry_slow_recent_base = 0.014
-        cfg.geometry_slow_recent_scale = 0.008
-        return cfg
-
-    @classmethod
-    def oft_calibrated_v3(cls) -> "PadiPhysicsConfig":
-        cfg = cls()
-        cfg.local_total_speed_thresh = 0.014
-        cfg.local_xy_speed_thresh = 0.0075
-        cfg.local_z_speed_thresh = 0.013
-        cfg.geometry_curve_offset = 0.015
-        cfg.geometry_curve_scale = 0.18
-        cfg.geometry_slow_total_base = 0.018
-        cfg.geometry_slow_total_scale = 0.011
-        cfg.geometry_slow_xy_base = 0.013
-        cfg.geometry_slow_xy_scale = 0.007
-        cfg.geometry_slow_recent_base = 0.016
-        cfg.geometry_slow_recent_scale = 0.009
-        return cfg
-
 
 @dataclass
 class PadiPhysicsState:
