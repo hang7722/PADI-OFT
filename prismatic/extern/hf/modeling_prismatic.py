@@ -630,6 +630,11 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
                 input_embeddings, projected_patch_embeddings, attention_mask
             )
+            self._set_runtime_fastv_query_ranges(
+                NUM_PATCHES=NUM_PATCHES,
+                NUM_PROMPT_TOKENS=NUM_PROMPT_TOKENS,
+                inserted_token_length=int(projected_patch_embeddings.shape[1]),
+            )
 
             # Build labels for multimodal sequence if needed
             multimodal_labels = self._build_multimodal_labels(labels, projected_patch_embeddings)
@@ -740,6 +745,15 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             "patches_per_image": int(
                 getattr(self, "fastv_patches_per_image", getattr(self.config, "fastv_patches_per_image", 256))
             ),
+            "score_source": getattr(self, "fastv_score_source", getattr(self.config, "fastv_score_source", "text_mean")),
+            "score_query_start": getattr(self, "runtime_fastv_score_query_start", None),
+            "score_query_end": getattr(self, "runtime_fastv_score_query_end", None),
+            "action_query_start": getattr(self, "runtime_fastv_action_query_start", None),
+            "action_query_end": getattr(self, "runtime_fastv_action_query_end", None),
+            "stop_token_index": getattr(self, "runtime_fastv_stop_token_index", None),
+            "proprio_start": getattr(self, "runtime_fastv_proprio_start", None),
+            "proprio_end": getattr(self, "runtime_fastv_proprio_end", None),
+            "layout": getattr(self, "runtime_fastv_layout", None),
         }
 
     # PADI-OFT FastV Stage-2
@@ -878,6 +892,40 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         }
         return last_hidden_states.index_select(dim=1, index=mapped)
 
+    def _set_runtime_fastv_query_ranges(self, NUM_PATCHES: int, NUM_PROMPT_TOKENS: int, inserted_token_length: int):
+        action_token_count = ACTION_DIM * NUM_ACTIONS_CHUNK
+        vision_start = int(getattr(self, "fastv_image_token_start_index", getattr(self.config, "fastv_image_token_start_index", 1)))
+        vision_length = int(getattr(self, "fastv_image_token_length", getattr(self.config, "fastv_image_token_length", 512)))
+        vision_end = vision_start + vision_length
+        inserted_end = vision_start + int(inserted_token_length)
+        action_query_start = int(NUM_PATCHES + NUM_PROMPT_TOKENS)
+        action_query_end = action_query_start + action_token_count
+        text_query_start = inserted_end
+        text_query_end = action_query_start
+        stop_token_index = action_query_end
+        proprio_start = vision_end
+        proprio_end = inserted_end
+
+        self.runtime_fastv_score_query_start = int(text_query_start)
+        self.runtime_fastv_score_query_end = int(text_query_end)
+        self.runtime_fastv_action_query_start = int(action_query_start)
+        self.runtime_fastv_action_query_end = int(action_query_end)
+        self.runtime_fastv_stop_token_index = int(stop_token_index)
+        self.runtime_fastv_proprio_start = int(proprio_start)
+        self.runtime_fastv_proprio_end = int(proprio_end)
+        self.runtime_fastv_layout = "bos_vision_proprio_text_action_stop"
+
+        sanity_ok = (
+            vision_start == 1
+            and vision_start < vision_end
+            and vision_end <= inserted_end
+            and inserted_end <= action_query_start
+            and text_query_start < text_query_end
+            and action_query_start < action_query_end
+            and stop_token_index == action_query_end
+        )
+        self.runtime_fastv_query_range_valid = bool(sanity_ok)
+
     def _unnormalize_actions(self, normalized_actions, unnorm_key=None):
         """Unnormalize actions using dataset statistics"""
         action_norm_stats = self.get_action_stats(unnorm_key)
@@ -1002,6 +1050,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Build multimodal embeddings and attention mask
         multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
             input_embeddings, projected_patch_embeddings, attention_mask
+        )
+        self._set_runtime_fastv_query_ranges(
+            NUM_PATCHES=NUM_PATCHES,
+            NUM_PROMPT_TOKENS=NUM_PROMPT_TOKENS,
+            inserted_token_length=int(projected_patch_embeddings.shape[1]),
         )
 
         # Forward pass through language model
