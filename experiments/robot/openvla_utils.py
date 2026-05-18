@@ -303,6 +303,7 @@ def get_vla(cfg: Any) -> torch.nn.Module:
     vla.fastv_image_token_start_index = cfg.fastv_image_token_start_index
     vla.fastv_image_token_length = cfg.fastv_image_token_length
     vla.fastv_patches_per_image = cfg.fastv_patches_per_image
+    vla.fastv_score_source = cfg.fastv_score_source
     vla.fastv_num_images_in_input = cfg.num_images_in_input
     vla.fastv_debug = cfg.fastv_debug
     if hasattr(vla, "config"):
@@ -312,6 +313,7 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         vla.config.fastv_image_token_start_index = cfg.fastv_image_token_start_index
         vla.config.fastv_image_token_length = cfg.fastv_image_token_length
         vla.config.fastv_patches_per_image = cfg.fastv_patches_per_image
+        vla.config.fastv_score_source = cfg.fastv_score_source
         vla.config.fastv_num_images_in_input = cfg.num_images_in_input
         vla.config.fastv_debug = cfg.fastv_debug
 

@@ -1195,6 +1195,17 @@ class LlamaModel(LlamaPreTrainedModel):
             "num_keep_per_image": [],
             "skipped": True,
             "skip_reason": "not_reached",
+            "score_source": fastv_config.get("score_source", "text_mean"),
+            "score_query_start": fastv_config.get("score_query_start", None),
+            "score_query_end": fastv_config.get("score_query_end", None),
+            "score_query_count": None,
+            "action_query_start": fastv_config.get("action_query_start", None),
+            "action_query_end": fastv_config.get("action_query_end", None),
+            "stop_token_index": fastv_config.get("stop_token_index", None),
+            "proprio_start": fastv_config.get("proprio_start", None),
+            "proprio_end": fastv_config.get("proprio_end", None),
+            "layout": fastv_config.get("layout", None),
+            "fastv_query_type": "unknown",
         }
 
         for layer_idx, decoder_layer in enumerate(self.layers):
@@ -1236,6 +1247,29 @@ class LlamaModel(LlamaPreTrainedModel):
                 elif image_token_length % num_images_in_input != 0 and "patches_per_image" not in fastv_config:
                     skip_reason = "non_divisible_image_token_length"
                 if skip_reason is None:
+                    score_source = fastv_config.get("score_source", "text_mean")
+                    score_q_start = None
+                    score_q_end = None
+                    if score_source == "text_mean":
+                        score_q_start = fastv_config.get("score_query_start", None)
+                        score_q_end = fastv_config.get("score_query_end", None)
+                        if score_q_start is None or score_q_end is None:
+                            skip_reason = "missing_text_query_range"
+                        elif score_q_start < 0 or score_q_end <= score_q_start or score_q_end > seq_len:
+                            skip_reason = "invalid_text_query_range"
+                    elif score_source == "action_mean":
+                        score_q_start = fastv_config.get("action_query_start", None)
+                        score_q_end = fastv_config.get("action_query_end", None)
+                        if score_q_start is None or score_q_end is None:
+                            skip_reason = "missing_action_query_range"
+                        elif score_q_start < 0 or score_q_end <= score_q_start or score_q_end > seq_len:
+                            skip_reason = "invalid_action_query_range"
+                    elif score_source == "last_query":
+                        score_q_start = seq_len - 1
+                        score_q_end = seq_len
+                    else:
+                        skip_reason = "invalid_fastv_score_source"
+                if skip_reason is None:
                     attn_avg = layer_attn.mean(dim=1)[0]
                     image_end = image_token_start_index + image_token_length
                     kept_vision_indices_by_image = []
@@ -1246,7 +1280,10 @@ class LlamaModel(LlamaPreTrainedModel):
                         seg_end = min(seg_start + patches_per_image, image_end)
                         if seg_start >= seg_end:
                             continue
-                        score_i = attn_avg[-1, seg_start:seg_end]
+                        if score_source == "last_query":
+                            score_i = attn_avg[-1, seg_start:seg_end]
+                        else:
+                            score_i = attn_avg[score_q_start:score_q_end, seg_start:seg_end].mean(dim=0)
                         num_keep_i = int(round((seg_end - seg_start) * (1.0 - fastv_r)))
                         num_keep_i = max(1, min(num_keep_i, seg_end - seg_start))
                         local_topk = score_i.topk(num_keep_i).indices + seg_start
@@ -1283,11 +1320,46 @@ class LlamaModel(LlamaPreTrainedModel):
                             "num_keep_per_image": num_keep_per_image,
                             "skipped": False,
                             "skip_reason": None,
+                            "score_source": score_source,
+                            "score_query_start": int(score_q_start),
+                            "score_query_end": int(score_q_end),
+                            "score_query_count": int(score_q_end - score_q_start),
+                            "fastv_query_type": (
+                                "text_or_prompt"
+                                if score_source == "text_mean"
+                                else ("action_slots" if score_source == "action_mean" else (
+                                    "stop"
+                                    if (seq_len - 1) == fastv_config.get("stop_token_index", None)
+                                    else (
+                                        "action_slot"
+                                        if fastv_config.get("action_query_start", -1) <= (seq_len - 1) < fastv_config.get("action_query_end", -1)
+                                        else (
+                                            "text_or_prompt"
+                                            if fastv_config.get("score_query_start", -1) <= (seq_len - 1) < fastv_config.get("score_query_end", -1)
+                                            else "unknown"
+                                        )
+                                    )
+                                ))
+                            ),
                         }
                     )
                 else:
-                    pruning_info["pruning_layer"] = int(layer_idx)
-                    pruning_info["skip_reason"] = skip_reason
+                    pruning_info.update(
+                        {
+                            "pruning_layer": int(layer_idx),
+                            "skip_reason": skip_reason,
+                            "skipped": True,
+                            "score_source": fastv_config.get("score_source", "text_mean"),
+                            "score_query_start": fastv_config.get("score_query_start", None),
+                            "score_query_end": fastv_config.get("score_query_end", None),
+                            "action_query_start": fastv_config.get("action_query_start", None),
+                            "action_query_end": fastv_config.get("action_query_end", None),
+                            "stop_token_index": fastv_config.get("stop_token_index", None),
+                            "proprio_start": fastv_config.get("proprio_start", None),
+                            "proprio_end": fastv_config.get("proprio_end", None),
+                            "layout": fastv_config.get("layout", None),
+                        }
+                    )
 
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:

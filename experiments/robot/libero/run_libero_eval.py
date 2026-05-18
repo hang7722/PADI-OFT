@@ -159,6 +159,7 @@ class GenerateConfig:
     fastv_image_token_start_index: int = 1          # FastV vision token block start index
     fastv_image_token_length: int = 512             # FastV total vision patch tokens (exclude proprio/diffusion)
     fastv_patches_per_image: int = 256              # FastV per-image patch count
+    fastv_score_source: str = "text_mean"           # FastV score source: text_mean/last_query/action_mean
     fastv_debug: bool = False                       # Print one-line FastV pruning summaries
     fastv_sanity_assert: bool = False               # Raise RuntimeError on FastV sanity check failures
     fastv_video_overlay: bool = False               # Overlay FastV pruning mask on dual-view rollout frames
@@ -204,6 +205,7 @@ def validate_config(cfg: GenerateConfig) -> None:
     assert cfg.fastv_image_token_start_index >= 0, "fastv_image_token_start_index must be >= 0"
     assert cfg.fastv_image_token_length > 0, "fastv_image_token_length must be > 0"
     assert cfg.fastv_patches_per_image > 0, "fastv_patches_per_image must be > 0"
+    assert cfg.fastv_score_source in ["text_mean", "last_query", "action_mean"], "invalid fastv_score_source"
     if cfg.use_fastv:
         expected_len = cfg.num_images_in_input * cfg.fastv_patches_per_image
         if cfg.fastv_image_token_length != expected_len:
@@ -339,7 +341,8 @@ def log_run_configuration(cfg: GenerateConfig, log_file=None):
                 f"[PADI-OFT Config][FastV] mode=dynamic_by_gsdr fastv_k={cfg.fastv_k} "
                 f"initial_fastv_r={initial_fastv_r:.4f} image_start={cfg.fastv_image_token_start_index} "
                 f"image_length={cfg.fastv_image_token_length} patches_per_image={cfg.fastv_patches_per_image} "
-                f"num_images={cfg.num_images_in_input} debug={cfg.fastv_debug} sanity_assert={cfg.fastv_sanity_assert}",
+                f"num_images={cfg.num_images_in_input} score_source={cfg.fastv_score_source} "
+                f"debug={cfg.fastv_debug} sanity_assert={cfg.fastv_sanity_assert}",
                 log_file,
             )
         else:
@@ -347,7 +350,8 @@ def log_run_configuration(cfg: GenerateConfig, log_file=None):
                 f"[PADI-OFT Config][FastV] mode=fixed fastv_k={cfg.fastv_k} fastv_r={cfg.fastv_r:.4f} "
                 f"image_start={cfg.fastv_image_token_start_index} image_length={cfg.fastv_image_token_length} "
                 f"patches_per_image={cfg.fastv_patches_per_image} num_images={cfg.num_images_in_input} "
-                f"debug={cfg.fastv_debug} sanity_assert={cfg.fastv_sanity_assert}",
+                f"score_source={cfg.fastv_score_source} debug={cfg.fastv_debug} "
+                f"sanity_assert={cfg.fastv_sanity_assert}",
                 log_file,
             )
 
@@ -697,6 +701,17 @@ def run_episode(
                         bos_preserved = 0 in kept_list
                         post_tokens_preserved = all(idx < vision_end for idx in pruned_list)
                         proprio_preserved = vision_end in kept_list
+                        score_source = pruning_info.get("score_source", None)
+                        score_query_start = pruning_info.get("score_query_start", None)
+                        score_query_end = pruning_info.get("score_query_end", None)
+                        score_query_count = pruning_info.get("score_query_count", None)
+                        fastv_query_type = pruning_info.get("fastv_query_type", None)
+                        action_query_start = pruning_info.get("action_query_start", None)
+                        action_query_end = pruning_info.get("action_query_end", None)
+                        stop_token_index = pruning_info.get("stop_token_index", None)
+                        proprio_start = pruning_info.get("proprio_start", None)
+                        proprio_end = pruning_info.get("proprio_end", None)
+                        layout = pruning_info.get("layout", None)
                         shape_ok = kept_seq_length == expected_kept_seq_length
                         if cfg.fastv_debug:
                             log_message(
@@ -708,7 +723,11 @@ def run_episode(
                                 f"post_tokens_preserved={post_tokens_preserved} fastv_k={fastv_k} fastv_r={fastv_r} "
                                 f"image_token_start_index={vision_start} image_token_length={vision_len} image_end={vision_end} "
                                 f"num_images_in_input={num_images_in_input} patches_per_image={patches_per_image} "
-                                f"num_keep_per_image={num_keep_per_image}",
+                                f"num_keep_per_image={num_keep_per_image} score_source={score_source} "
+                                f"score_query_range=({score_query_start}, {score_query_end}) "
+                                f"score_query_count={score_query_count} fastv_query_type={fastv_query_type} "
+                                f"action_range=({action_query_start}, {action_query_end}) stop_token_index={stop_token_index} "
+                                f"proprio_range=({proprio_start}, {proprio_end}) layout={layout}",
                                 log_file,
                             )
                             if remap_info is not None:
